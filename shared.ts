@@ -1,0 +1,238 @@
+import { readFileSync } from "node:fs";
+import { Type } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+export { BUILTIN_IDENTITIES, formatAgentTree, formatIdentityUsageLine, formatProgress, formatTokenUsage, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TokenUsage } from "./runtime.ts";
+
+export type TeamRole = "boss" | "lead" | "worker";
+export type AgentStatus = "starting" | "running" | "idle" | "recovering" | "cancelled" | "failed";
+
+export interface TeamInstanceConfig {
+	actorEpoch: string;
+	agentId: string;
+	departmentId?: string;
+	identity?: string;
+	parentId?: string;
+	role: TeamRole;
+	serverUrl: string;
+	task: string;
+	teamId: string;
+	token: string;
+}
+
+export interface TeamEvent {
+	actorId: string;
+	content: string;
+	departmentId?: string;
+	eventId: string;
+	kind: "message" | "status" | "assignment" | "control" | "error";
+	seq: number;
+	targetIds: string[];
+	taskId?: string;
+	timestamp: string;
+}
+
+export interface AgentRecord {
+	actorEpoch: string;
+	agentId: string;
+	departmentId?: string;
+	identity?: string;
+	lastContextSeq?: number;
+	model?: string;
+	name: string;
+	parentId?: string;
+	path?: string;
+	pid?: number;
+	role: TeamRole;
+	runCount?: number;
+	sessionPath?: string;
+	status: AgentStatus;
+	task: string;
+	tokenUsage?: TokenUsage;
+}
+
+export interface TeamSnapshot {
+	agents: AgentRecord[];
+	focusedBossId?: string;
+	teamId: string;
+}
+
+export const TEAM_INSTANCE_FLAG = "team-instance";
+export const TEAM_EVENT_ENTRY = "pi-team-event";
+export const TEAM_STATE_ENTRY = "pi-team-state";
+export const MAX_CHILDREN = 4;
+
+function normalizeText(value: unknown): string {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+export function getMessageText(message: { content?: unknown } | undefined): string {
+	if (!message) return "";
+	if (typeof message.content === "string") return message.content.trim();
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter((block): block is { type: "text"; text: string } => {
+			if (!block || typeof block !== "object") return false;
+			const item = block as { type?: string; text?: string };
+			return item.type === "text" && typeof item.text === "string";
+		})
+		.map((block) => block.text)
+		.join("\n")
+		.trim();
+}
+
+export function readInstanceConfig(pi: ExtensionAPI): TeamInstanceConfig | undefined {
+	const flagIndex = process.argv.findIndex((arg) => arg === `--${TEAM_INSTANCE_FLAG}` || arg.startsWith(`--${TEAM_INSTANCE_FLAG}=`));
+	const rawArg = flagIndex === -1
+		? undefined
+		: process.argv[flagIndex].includes("=")
+			? process.argv[flagIndex].slice(process.argv[flagIndex].indexOf("=") + 1)
+			: process.argv[flagIndex + 1];
+	const configPath = rawArg ?? pi.getFlag(TEAM_INSTANCE_FLAG);
+	if (typeof configPath !== "string" || !configPath.trim()) return undefined;
+	const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Partial<TeamInstanceConfig>;
+	if (
+		!normalizeText(parsed.agentId) ||
+		!normalizeText(parsed.actorEpoch) ||
+		!normalizeText(parsed.serverUrl) ||
+		!normalizeText(parsed.teamId) ||
+		!normalizeText(parsed.token) ||
+		!normalizeText(parsed.task) ||
+		!(["boss", "lead", "worker"] as const).includes(parsed.role as TeamRole)
+	) {
+		throw new Error(`Invalid Pi Team instance config: ${configPath}`);
+	}
+	return parsed as TeamInstanceConfig;
+}
+
+async function request<T>(config: TeamInstanceConfig, path: string, body: unknown): Promise<T> {
+	const response = await fetch(`${config.serverUrl}${path}`, {
+		method: "POST",
+		headers: {
+			"authorization": `Bearer ${config.token}`,
+			"content-type": "application/json",
+			"x-pi-team-actor": config.agentId,
+			"x-pi-team-epoch": config.actorEpoch,
+		},
+		body: JSON.stringify(body),
+	});
+	const payload = (await response.json()) as { error?: string } & T;
+	if (!response.ok) throw new Error(payload.error || `Pi Team request failed: ${response.status}`);
+	return payload;
+}
+
+export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole): void {
+	const config = readInstanceConfig(pi);
+	if (!config) throw new Error(`${expectedRole} extension requires --${TEAM_INSTANCE_FLAG} <config.json>`);
+	if (config.role !== expectedRole) throw new Error(`Expected role ${expectedRole}, got ${config.role}`);
+
+	pi.registerTool({
+		name: "team_send",
+		label: "Team Send",
+		description: "Send a directed message to another Pi Team role.",
+		parameters: Type.Object({
+			target: Type.String({ description: "Target agent ID" }),
+			message: Type.String({ description: "Message to deliver" }),
+		}),
+		async execute(_id, params) {
+			const result = await request<{ delivered: boolean }>(config, "/send", params);
+			return { content: [{ type: "text", text: `Message delivered to ${params.target}.` }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_models",
+		label: "Team Models",
+		description: "List the identity pool: each identity maps to a model, so delegation can pick one with a suitable price for the business.",
+		parameters: Type.Object({}),
+		async execute() {
+			const result = await request<{ models: Record<string, string> }>(config, "/identities", {});
+			const entries = Object.entries(result.models);
+			const text = entries.length
+				? entries.map(([identity, pattern]) => `${identity}: ${pattern}`).join("\n")
+				: "No identity pool configured; agents use Pi's default model resolution.";
+			return { content: [{ type: "text", text }], details: result };
+		},
+	});
+
+	if (expectedRole !== "worker") {
+		pi.registerTool({
+			name: "team_delegate",
+			label: "Team Delegate",
+			description:
+				expectedRole === "boss"
+					? "Delegate substantive project execution to the minimum sufficient Department Leads. For new non-conflicting tasks, create Leads in parallel by default; do not cancel an existing Team unless the user explicitly says stop, pause, or replace."
+					: "Delegate substantive execution to the minimum sufficient Workers. One coherent task normally needs one Worker; capacity is not a target.",
+			promptGuidelines: expectedRole === "boss"
+				? [
+					"Do not implement substantive project work yourself; scope it and delegate execution to the minimum sufficient Leads.",
+					"For a new set of non-conflicting tasks, create a Lead for each task in parallel by default; use one Lead only when the work is truly one coherent workstream.",
+					"Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace.",
+					"Call team_models before delegation. Leads normally use high: choose vision-high only for visual or GUI evidence, otherwise text-high; pass only an available identity.",
+				]
+				: [
+					"Do not implement substantive Worker tasks yourself; coordinate, review, and delegate execution.",
+					"Use one Worker for one coherent task and add more only for genuinely independent parallel work.",
+					"Call team_models before delegation. Prefer medium for ordinary work, low for simple bounded work, and high only for genuinely complex work; choose vision only for visual or GUI evidence, otherwise text.",
+				],
+			parameters: Type.Object({
+				task: Type.String({ description: "Concrete delegated task with a verifiable outcome" }),
+				reason: Type.String({ minLength: 12, description: "Why this needs a new role rather than a suitable existing subordinate" }),
+				name: Type.Optional(Type.String({ description: "Short display name" })),
+				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers" })),
+			}),
+			async execute(_id, params) {
+				const result = await request<{ agent: AgentRecord }>(config, "/delegate", params);
+				return {
+					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId}: ${result.agent.task}` }],
+					details: result,
+				};
+			},
+		});
+
+		pi.registerTool({
+			name: "team_cancel",
+			label: "Team Remove",
+			description: "Stop and remove one of your direct subordinate agents and its descendants from the active team.",
+			parameters: Type.Object({ target: Type.String({ description: "Direct subordinate agent ID" }) }),
+			async execute(_id, params) {
+				const result = await request<{ cancelled: string[] }>(config, "/cancel", params);
+				return { content: [{ type: "text", text: `Removed: ${result.cancelled.join(", ")}` }], details: result };
+			},
+		});
+	}
+
+	pi.registerTool({
+		name: "team_read",
+		label: "Team Read",
+		description: expectedRole === "boss"
+			? "Read recent formal events for this Boss. Defaults to user and direct Lead reports; set drillDown to inspect Worker records."
+			: "Read recent formal group-chat events visible to this role.",
+		parameters: Type.Object({
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 30 })),
+			drillDown: Type.Optional(Type.Boolean({ description: "Boss only: include Worker-level records" })),
+		}),
+		async execute(_id, params) {
+			const result = await request<{ events: TeamEvent[] }>(config, "/events", { limit: params.limit ?? 30, drillDown: params.drillDown === true });
+			const text = result.events
+				.map((event) => `#${event.seq} ${event.actorId} -> ${event.targetIds.join(",") || "group"}: ${event.content}`)
+				.join("\n");
+			return { content: [{ type: "text", text: text || "No visible team events." }], details: result };
+		},
+	});
+
+	pi.registerTool({
+		name: "team_list",
+		label: "Team List",
+		description: "List the Pi Team roles you are allowed to see.",
+		parameters: Type.Object({}),
+		async execute() {
+			const result = await request<{ agents: AgentRecord[] }>(config, "/list", {});
+			const text = result.agents.map((agent) => `${agent.path || agent.agentId} [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n");
+			return { content: [{ type: "text", text: text || "No team agents." }], details: result };
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.hasUI) ctx.ui.setStatus("pi-team-role", `${config.role}:${config.agentId}`);
+	});
+}

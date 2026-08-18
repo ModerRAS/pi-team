@@ -1,0 +1,31 @@
+{
+  "name": "moder-pi-team",
+  "version": "0.1.0",
+  "description": "Multi-role Boss, Department Lead, and Worker collaboration for Pi",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test reliability.test.mjs"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "index.ts",
+    "runtime.ts",
+    "shared.ts",
+    "windows-job.ts",
+    "README.md",
+    "DESIGN.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
