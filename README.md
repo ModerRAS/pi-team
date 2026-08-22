@@ -151,4 +151,4 @@ node crash-smoke.mjs    # Windows 强杀 Supervisor 的 crash clean 验证
 
 ## 许可
 
-[MIT](./LICENSE)
+[GPL-3.0](./LICENSE)
