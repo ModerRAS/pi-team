@@ -30,10 +30,12 @@ Supervisor 启动子 Pi 时注入内部实例配置；用户不需要也不应�
 ## 安装
 
 ```bash
-pi install /absolute/path/to/ModerPiPlugins/extensions/pi-team
+pi install git:github.com/ModerRAS/pi-team
 ```
 
-也可以作为 npm 包 `moder-pi-team` 安装。安装 `pi-team` 不会安装或加载同仓库的 `goal` 与 `infinite-retry`。
+也可以用本地路径安装：`pi install /absolute/path/to/ModerPiPlugins/extensions/pi-team`。
+
+安装 `pi-team` 不会安装或加载同仓库的 `goal` 与 `infinite-retry`。
 
 ## 快速开始
 
@@ -46,7 +48,7 @@ pi install /absolute/path/to/ModerPiPlugins/extensions/pi-team
 /team                          <- Team 摘要、可恢复 Session 路径和内部 IPC 地址
 ```
 
-Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，只在 Team 管理权限上受限为 `team_send`、`team_read` 和 `team_list`，不能继续委派或移除其他角色。
+Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，在 Team 工具上只保留 `team_send`、`team_models`、`team_read` 和 `team_list`，不能继续委派或移除其他角色。
 
 ## 命令一览
 
@@ -59,8 +61,10 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 | `/agents` | 查看角色状态 |
 | `/view [limit]` | 查看最近正式群聊事件 |
 | `/inspect <agent-id>` | 让底部 Inspector 持续显示该角色的运行状态和工具生命周期；`/inspect off` 返回团队状态 |
+| `/identities` | 查看当前档位池 |
 | `/team` | 查看 Team 摘要、可恢复主 Session 路径和内部 IPC 地址 |
-| `/new` / `/resume` / `/fork` | 创建空 Team / 恢复 Team / 复制 Team 前缀 |
+
+`/new`、`/resume`、`/fork` 是 pi 核心 Session 命令，插件会响应其会话缘由：`/new` 创建空 Team，`/resume` 恢复既有 Team，`/fork` 复制 Team 前缀；树分支切换会停止旧角色并恢复目标分支。
 
 `team_send` 的普通消息可发给同一 Pi Team 中任意其他 Boss、Lead 或 Worker。目标支持稳定 agent id、完整层级路径、这些形式前加 `@`，以及唯一显示名；显示名歧义、未知目标和 self-message 都会拒绝。该放宽只适用于消息，不改变委派、取消、角色列表或事件上下文的原有权限。
 
