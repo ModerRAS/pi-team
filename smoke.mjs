@@ -163,7 +163,7 @@ try {
 		nonDirectLeadWorker: "TEAM_MSG_NONDIRECT_LEAD_WORKER",
 		reverseLeadWorker: "TEAM_MSG_REVERSE_LEAD_WORKER",
 	};
-	await postAs(leadConfig, "/send", { target: `@${workers[0].agent.agentId}`, message: messages.parentChild });
+	const parentChildSend = await postAs(leadConfig, "/send", { target: `@${workers[0].agent.agentId}`, message: messages.parentChild });
 	await postAs(workerConfigs[0], "/send", { target: `@${workers[1].agent.path}`, message: messages.siblingWorker });
 	await postAs(workerConfigs[0], "/send", { target: "@Cross Branch Worker", message: messages.crossWorker });
 	await postAs(leadConfig, "/send", { target: crossLead.path, message: messages.siblingLead });
@@ -180,10 +180,20 @@ try {
 	const crossMessage = messagingEntries.find((entry) => entry.customType === "pi-team-event" && entry.data?.content === messages.crossWorker);
 	if (crossMessage?.data?.actorId !== workers[0].agent.agentId || crossMessage.data.targetIds?.[0] !== crossWorker.agentId) throw new Error("Cross-worker group-chat event lost authenticated actor or target identity");
 
+	if (!parentChildSend.seq || !parentChildSend.eventId || !parentChildSend.timestamp) throw new Error("team_send did not return a dispatch receipt");
+	const escalation = await postAs(workerConfigs[0], "/escalate", { reason: "Smoke: verify the structured escalation path reaches the parent.", needed: "write" });
+	if (!escalation.escalated || !escalation.seq) throw new Error("team_escalate did not return a control receipt");
+	await waitForEntry((items) => items.some((entry) => entry.customType === "pi-team-event" && entry.data?.kind === "control" && entry.data?.actorId === workers[0].agent.agentId && String(entry.data?.content).includes("needs write")));
+	const artifactPath = `smoke-artifacts/${workers[1].agent.agentId}.md`;
+	const obligation = await postAs(workerConfigs[1], "/require-artifact", { path: artifactPath, note: "Smoke: a declared artifact that never appears must be a hard settle failure." });
+	if (!obligation.artifacts?.includes(artifactPath)) throw new Error("Artifact obligation was not recorded on the agent");
+	await postAs(leadConfig, "/send", { target: workers[1].agent.agentId, message: "TEAM_MSG_ARTIFACT_TASK: finish your assigned task, then settle." });
+	await waitForEntry((items) => items.some((entry) => entry.customType === "pi-team-event" && entry.data?.kind === "error" && String(entry.data?.content).includes(`settled without required artifact(s): ${artifactPath}`)));
+
 	let fifthRejected = false;
 	try { await postAs(leadConfig, "/delegate", { task: "This fifth worker must be rejected.", reason: "Verify the hard safety ceiling still rejects a fifth concurrent Worker." }); }
-	catch (error) { fifthRejected = String(error).includes("already has 4 active children"); }
-	if (!fifthRejected) throw new Error("Fifth Worker was not rejected by the capacity limit");
+	catch (error) { fifthRejected = /already has 4 active children: .*\((idle|running|starting|recovering|failed)\)/.test(String(error)); }
+	if (!fifthRejected) throw new Error("Fifth Worker was not rejected by the capacity limit with per-child states");
 	await postAs(leadConfig, "/cancel", { target: workers[0].agent.agentId });
 	let listed = await postAs(leadConfig, "/list", {});
 	if (listed.agents.some((agent) => agent.agentId === workers[0].agent.agentId) || listed.agents.filter((agent) => agent.role === "worker").length !== 3) throw new Error("Lead removal did not delete its direct Worker from the active team");
@@ -202,7 +212,7 @@ try {
 	if (!entries.some((entry) => entry.customType === "pi-team-state" && entry.data?.focusedBossId === "boss-1")) throw new Error("Focused Boss was not persisted");
 	if (events.some((event) => event.type === "non-json")) throw new Error("RPC stdout contained non-JSON output");
 	if (stderr.trim()) throw new Error(`Supervisor stderr was not empty: ${stderr.trim()}`);
-	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok messaging=parent+sibling+cross-branch visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
+	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
 } finally {
 	for (const item of pending.values()) {
 		clearTimeout(item.timer);

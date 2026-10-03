@@ -13,6 +13,7 @@
 - **持续监督**：Worker 每 10 分钟触发 Lead 巡检，直到 settled；事件游标让 Lead 无需轮询即可拿到增量消息。
 - **token 计量与对账**：每个角色的 token 用量随每次 LLM 调用实时统计，settled 时与 Session 文件对账，随 Team 状态持久化。
 - **上下文友好**：system prompt、工具集和历史 Session 追加式保持稳定，定向消息正文只在正式事件中保留一份。
+- **交付面可观测**：派发返回事件序号，唤醒时列出「已发出但对方还没有后续动作」的消息；点名了下级却没调用派发工具会被记录；`team_require_artifact` 声明必须落盘的产物，settle 时缺失按硬失败上报；`team_escalate` 让 Lead/Worker 结构化请求缺失的能力。
 
 ## 架构
 
@@ -48,7 +49,7 @@ pi install git:github.com/ModerRAS/pi-team
 /team                          <- Team 摘要、可恢复 Session 路径和内部 IPC 地址
 ```
 
-Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，在 Team 工具上只保留 `team_send`、`team_models`、`team_read` 和 `team_list`，不能继续委派或移除其他角色。
+Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，在 Team 工具上只保留 `team_send`、`team_models`、`team_read`、`team_list`、`team_escalate` 和 `team_require_artifact`，不能继续委派或移除其他角色。Lead 和 Worker 都能用 `team_escalate` 报告被挡住的能力，用 `team_require_artifact` 声明本轮必须产出的文件。
 
 ## 命令一览
 
@@ -119,6 +120,16 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 - 每次角色被唤醒，Supervisor 自动注入该角色上次事件游标之后、截至本次唤醒的全部可见正式事件；游标随 Team 状态持久化。
 - 运行中的 Worker 每 10 分钟触发一次 Lead 巡检并继续重复，直到 Worker settled、被移除或退出。即使区间内没有新 assistant 文本，也会明确报告仍在运行。
 
+### 交付、派发与能力升级
+
+- **产物义务**：Lead/Worker 用 `team_require_artifact { path, note? }` 声明本轮必须存在的产物。`agent_settled` 时 Supervisor 按该角色工作目录解析路径并检查；缺失时不报干净的 idle，而是写入 `kind: "error"` 事件、通知 Lead，并把该角色唤醒一次要求补齐或说明原因；再次 settle 仍缺失则标记 `failed`。全部存在后义务清空，随取消一起失效；义务列表随 Team 状态持久化。
+- **派发回执**：`team_send` 返回 `{ delivered, eventId, seq, timestamp }`，正文带上 `#seq`。派发因此可以被引用，「我发出去了」从回忆变成可核对的事实；`delivered` 仍然只表示已写入并尝试唤醒。
+- **投递缺口**：唤醒角色时，Supervisor 会列出该角色发出、但目标之后没有任何事件的消息（`#12 -> lead-1 at ...: delivered, no event from the target since`）。这与回执互补：回执说明「确实发出」，这里说明「对方还没有后续动作」，用于判断裁决是否真的送达。
+- **决定 ≠ 派发**：Boss/Lead 一轮结束时，如果最后的 assistant 正文提到了直属下级（稳定 agent id 或完整层级路径），而本轮既没调用 `team_send` 也没调用 `team_delegate`，Supervisor 追加一条指向该执行者的 `kind: "error"` 事件并唤醒它一次，要求真的派发或确认只是汇报。同一段正文只提醒一次，避免自唤醒循环。
+- **能力升级**：Lead/Worker 用 `team_escalate { reason, needed?, kind? }` 请求 `write`/`code` 能力，Supervisor 追加 `kind: "control"` 事件并唤醒父角色。宿主 Pi 侧的 investigate/写锁由 Pi 自己控制，本插件只负责把「被挡住」结构化上报，不悄悄放开写入。
+- **容量拒绝带状态**：达到 4 个直接下级上限时，报错逐个列出下级及其状态并标出可释放的 idle 数量（`lead-1 already has 4 active children: worker-64 (idle), worker-75 (running) — 1 idle may be released via team_cancel`）。idle 在显式 `team_cancel` 之前仍然占位，上限规则不变。
+- **委派软提醒**：`team_delegate` 未传 `identity` 时，结果里附一句 `team_models` 提醒，不阻断委派，也不改变默认沿用主模型的行为。
+
 ### 计量与 UI
 
 - 每个角色的 token 用量（输入、输出、缓存读写、费用）随每次 LLM 调用实时统计（`message_end` 事件），并在 settled 时与 Session 文件对账；随 Team 状态持久化。底部树和 Inspector 显示为 `in 1.2M out 340k cache 900k $0.42`。
@@ -131,6 +142,7 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 - Supervisor IPC 只监听 loopback，并验证 `agentId + actorEpoch + instanceToken`。每个 Supervisor 只维护自己的 Team registry；跨 Team 请求无法通过实例认证。
 - 意外退出会以新的 epoch/token 从 Session 副本恢复，并要求角色先检查实际工作区状态。
 - 委派数量按任务动态决定；4 是安全上限而不是目标。新角色必须有具体的独立工作理由，并优先复用现有合适角色。
+- 派发检查只看正文里的 agent id / 层级路径，不做中文祈使句判断：只是提到某个下级会被误报，指令里没写 id 会被漏报。误报只多一次提醒（同一段正文不重复），真实语义判断仍由模型负责。
 - 除非用户明确说「停止」「暂停」或「替换」，不得取消已有 Team 或其角色。
 
 ### 上下文缓存

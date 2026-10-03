@@ -208,7 +208,7 @@ type TeamEvent = {
 };
 ```
 
-`seq` 只表示 Supervisor 的提交顺序，不等于真实因果顺序、消息处理顺序或结果有效性。结果是否有效由 `taskId + generation + causationId + disposition` 判断。
+`seq` 只表示 Supervisor 的提交顺序，不等于真实因果顺序、消息处理顺序或结果有效性。结果是否有效由 `taskId + generation + causationId + disposition` 判断。`team_send` 把本次派发的 `seq/eventId` 作为回执返回给调用方，供后续引用；回执是写入侧的，不等于已读或已处理。
 
 正式事件至少包括：
 
@@ -286,11 +286,15 @@ team_publish
 team_send
 team_delegate
 team_cancel_request
+team_escalate
+team_require_artifact
 team_read_department
 team_read_agent
 team_read_events
 team_list
 ```
+
+`team_escalate` 用于把「被能力或写锁挡住」结构化上报给父角色，`team_require_artifact` 用于声明本轮必须落盘的产物（settle 时缺失按硬失败处理）。两者都不改变角色权限，只把隐式状态变成正式事件。
 
 ## 取消与迟到结果
 
