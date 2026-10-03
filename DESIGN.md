@@ -386,6 +386,8 @@ Inspector 作为 `nonCapturing` overlay，不手工把焦点设为 `null`。真�
 
 档位池是给 Boss/Lead 委派时查的“档位 → 模型”选型表，按是否支持视觉 × 高中低共 6 档，只决定新角色用什么模型（价格/能力），不注入任何提示词。映射由用户在项目 `.pi/pi-team/identities.json` 或全局 `~/.pi/agent/pi-team-identities.json` 配置（项目优先，旧 `models.json` 兼容）。不传 `identity` 时新角色默认使用主对话当前模型（所有角色同一模型）；传了才从档位池解析并传 `--model <pattern>` 给子 Pi；未知档位拒绝。档位随 AgentRecord 持久化，恢复时重新解析。目标：规划/审查用深度推理档，简单操作用低价档，视觉调试用视觉档，降低整体 token 用量。
 
+内置档位 `inherited` 永远可用，表示主对话当前模型：不配置档位池时 `team_models` 只返回这一行，委派时传 `inherited` 与不传 `identity` 等价（都按主模型 spawn，前者是显式可记录的写法）；档位池里显式定义 `inherited` 则以池为准。这样「全部角色共用同一个模型」不需要写六个相同档位，也让调用模型不必依赖「未配置即用默认」这种看不见的路径。所有档位指向同一模型时，`team_models` 会提示改用 `inherited`。
+
 ## 建议的实现顺序
 
 1. RPC smoke test：Windows 启动、插件继承、严格 JSONL、独立 Session、steer/abort/settled、父进程清理。

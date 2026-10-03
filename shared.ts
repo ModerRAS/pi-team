@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-export { BUILTIN_IDENTITIES, formatAgentTree, formatIdentityUsageLine, formatProgress, formatTokenUsage, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TokenUsage } from "./runtime.ts";
+import { formatIdentityLines } from "./runtime.ts";
+export { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TokenUsage } from "./runtime.ts";
 
 export type TeamRole = "boss" | "lead" | "worker";
 export type AgentStatus = "starting" | "running" | "idle" | "recovering" | "cancelled" | "failed";
@@ -182,15 +183,11 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 	pi.registerTool({
 		name: "team_models",
 		label: "Team Models",
-		description: "List the identity pool: each identity maps to a model, so delegation can pick one with a suitable price for the business.",
+		description: "List the identity pool: each identity maps to a model, so delegation can pick one with a suitable price for the business. The built-in identity \"inherited\" always means the main session model; pass it when every role should use the same model instead of writing one tier per role.",
 		parameters: Type.Object({}),
 		async execute() {
-			const result = await request<{ models: Record<string, string> }>(config, "/identities", {});
-			const entries = Object.entries(result.models);
-			const text = entries.length
-				? entries.map(([identity, pattern]) => `${identity}: ${pattern}`).join("\n")
-				: "No identity pool configured; agents use Pi's default model resolution.";
-			return { content: [{ type: "text", text }], details: result };
+			const result = await request<{ models: Record<string, string>; identities?: { identity: string; inherited?: boolean; pattern?: string }[] }>(config, "/identities", {});
+			return { content: [{ type: "text", text: formatIdentityLines(result.models, result.identities).join("\n") }], details: result };
 		},
 	});
 
@@ -218,7 +215,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				task: Type.String({ description: "Concrete delegated task with a verifiable outcome" }),
 				reason: Type.String({ minLength: 12, description: "Why this needs a new role rather than a suitable existing subordinate" }),
 				name: Type.Optional(Type.String({ description: "Short display name" })),
-				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers" })),
+				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers; \"inherited\" means the main session model" })),
 			}),
 			async execute(_id, params) {
 				const result = await request<{ agent: AgentRecord }>(config, "/delegate", params);
