@@ -51,16 +51,58 @@ export function readModelPool(poolPath: string): ModelPool {
 	return readJsonFile<ModelPool>(poolPath) ?? {};
 }
 
+/**
+ * Reserved identity meaning "the main session model".
+ * Some callers cannot act on an unconfigured pool, so `team_models` always lists this row; an explicit pool
+ * entry with this name wins.
+ */
+export const INHERITED_IDENTITY = "inherited";
+
+export function mainModelPattern(mainModel: { provider: string; id: string } | undefined): string | undefined {
+	return mainModel ? `${mainModel.provider}/${mainModel.id}` : undefined;
+}
+
 export function resolveModelPattern(pool: ModelPool, identity?: string): string | undefined {
 	if (!identity) return pool.default;
 	const pattern = pool[identity];
-	if (!pattern) throw new Error(`Unknown identity: "${identity}". Add it to .pi/pi-team/identities.json; configured: ${Object.keys(pool).join(", ") || "none"}`);
+	if (!pattern) throw new Error(`Unknown identity: "${identity}". Add it to .pi/pi-team/identities.json; configured: ${Object.keys(pool).join(", ") || "none"}; built-in: "${INHERITED_IDENTITY}" (main session model)`);
 	return pattern;
 }
 
 export function resolveSpawnModel(pool: ModelPool, identity: string | undefined, mainModel: { provider: string; id: string } | undefined): string | undefined {
-	if (identity) return resolveModelPattern(pool, identity);
-	return mainModel ? `${mainModel.provider}/${mainModel.id}` : undefined;
+	const key = identity?.trim();
+	if (!key) return mainModelPattern(mainModel);
+	if (key === INHERITED_IDENTITY && !pool[key]) return mainModelPattern(mainModel);
+	return resolveModelPattern(pool, key);
+}
+
+/** Effective identity list for `team_models`: the configured pool plus the built-in `inherited` row. */
+export function identityRows(pool: ModelPool, mainModel?: { provider: string; id: string }): { identity: string; inherited?: boolean; pattern?: string }[] {
+	const rows: { identity: string; inherited?: boolean; pattern?: string }[] = Object.entries(pool).map(([identity, pattern]) => ({ identity, pattern }));
+	if (!(INHERITED_IDENTITY in pool)) rows.push({ identity: INHERITED_IDENTITY, inherited: true, pattern: mainModelPattern(mainModel) });
+	return rows;
+}
+
+/** Note when every configured tier aliases one model, so identical rows are not read as separate choices. */
+export function degeneratePoolNote(pool: ModelPool): string | undefined {
+	const patterns = Object.values(pool);
+	if (patterns.length < 2 || new Set(patterns).size > 1) return undefined;
+	return `All ${patterns.length} tiers map to ${patterns[0]}. If one model is intended, drop the pool file and pass identity "${INHERITED_IDENTITY}" instead.`;
+}
+
+/** Lines printed by `team_models`: the effective identities, then the empty-pool hint and the degenerate-pool note. */
+export function formatIdentityLines(models: ModelPool, identities?: { identity: string; inherited?: boolean; pattern?: string }[]): string[] {
+	const rows: { identity: string; inherited?: boolean; pattern?: string }[] = identities ?? Object.entries(models).map(([identity, pattern]) => ({ identity, pattern }));
+	const lines = rows.map((row) => {
+		if (!row.inherited) return `${row.identity}: ${row.pattern}`;
+		return row.pattern
+			? `${row.identity}: ${row.pattern} (main session model; pass identity "${row.identity}")`
+			: `${row.identity} (main session model; pass identity "${row.identity}")`;
+	});
+	if (!Object.keys(models).length) lines.push(`No identity pool configured; add .pi/pi-team/identities.json to choose a model per tier, or keep passing identity "${INHERITED_IDENTITY}".`);
+	const note = degeneratePoolNote(models);
+	if (note) lines.push(note);
+	return lines;
 }
 
 export function formatProgress(progress: unknown): string {

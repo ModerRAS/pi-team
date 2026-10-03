@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BUILTIN_IDENTITIES, formatAgentTree, formatIdentityUsageLine, formatProgress, formatTokenUsage, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic } from "./runtime.ts";
+import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic } from "./runtime.ts";
 import { childCapacityError, undispatchedTargets, unansweredMessages } from "./shared.ts";
 
 test("capacity rejection names child states and releasable idle slots", () => {
@@ -175,6 +175,53 @@ test("identities.json overrides models.json", async () => {
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("built-in inherited identity means the main model unless the pool defines it", () => {
+	const pool = { "text-low": "opencode-go/mimo-v2.5-pro" };
+	const main = { provider: "opencode-go", id: "deepseek-v4-flash" };
+
+	assert.equal(INHERITED_IDENTITY, "inherited");
+	assert.equal(mainModelPattern(main), "opencode-go/deepseek-v4-flash");
+	assert.equal(mainModelPattern(undefined), undefined);
+	assert.equal(resolveSpawnModel(pool, "inherited", main), "opencode-go/deepseek-v4-flash");
+	assert.equal(resolveSpawnModel(pool, " inherited ", main), "opencode-go/deepseek-v4-flash");
+	assert.equal(resolveSpawnModel(pool, "inherited", undefined), undefined);
+	assert.equal(resolveSpawnModel(pool, undefined, main), "opencode-go/deepseek-v4-flash");
+	assert.equal(resolveSpawnModel({ inherited: "vendor/pinned" }, "inherited", main), "vendor/pinned");
+	assert.throws(() => resolveSpawnModel(pool, "nope", main), /built-in: "inherited" \(main session model\)/);
+});
+
+test("identity rows always expose inherited and flag a degenerate pool", () => {
+	const main = { provider: "opencode-go", id: "deepseek-v4-flash" };
+	const pool = { "text-high": "vendor/same", "text-low": "vendor/same" };
+
+	assert.deepEqual(identityRows({}, main), [{ identity: INHERITED_IDENTITY, inherited: true, pattern: "opencode-go/deepseek-v4-flash" }]);
+	assert.deepEqual(identityRows(pool, main).map((row) => row.identity), ["text-high", "text-low", INHERITED_IDENTITY]);
+	assert.deepEqual(identityRows({ inherited: "vendor/pinned" }, main), [{ identity: "inherited", pattern: "vendor/pinned" }]);
+	assert.match(degeneratePoolNote(pool), /All 2 tiers map to vendor\/same\. If one model is intended, drop the pool file and pass identity "inherited" instead\./);
+
+	assert.equal(degeneratePoolNote({}), undefined);
+	assert.equal(degeneratePoolNote({ only: "vendor/same" }), undefined);
+	assert.equal(degeneratePoolNote({ "text-high": "vendor/a", "text-low": "vendor/b" }), undefined);
+});
+
+test("team_models output lists inherited alone when no pool is configured", () => {
+	const main = { provider: "opencode-go", id: "deepseek-v4-flash" };
+
+	assert.deepEqual(formatIdentityLines({}, identityRows({}, main)), [
+		"inherited: opencode-go/deepseek-v4-flash (main session model; pass identity \"inherited\")",
+		"No identity pool configured; add .pi/pi-team/identities.json to choose a model per tier, or keep passing identity \"inherited\".",
+	]);
+	assert.deepEqual(formatIdentityLines({ "text-low": "vendor/same" }, identityRows({ "text-low": "vendor/same" }, main)), [
+		"text-low: vendor/same",
+		"inherited: opencode-go/deepseek-v4-flash (main session model; pass identity \"inherited\")",
+	]);
+	const sixAliases = Object.fromEntries(["text-high", "text-medium", "text-low", "vision-high", "vision-medium", "vision-low"].map((identity) => [identity, "vendor/one"]));
+	const aliasLines = formatIdentityLines(sixAliases, identityRows(sixAliases, undefined));
+	assert.equal(aliasLines.length, 8);
+	assert.equal(aliasLines[6], "inherited (main session model; pass identity \"inherited\")");
+	assert.equal(aliasLines[7], "All 6 tiers map to vendor/one. If one model is intended, drop the pool file and pass identity \"inherited\" instead.");
 });
 
 test("spawn model falls back to main conversation model when no identity", () => {

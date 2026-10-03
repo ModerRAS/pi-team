@@ -95,11 +95,12 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 | `vision-medium` | 常规视觉调试 |
 | `vision-low` | 简单视觉任务 |
 
-- **配置位置**：项目 `.pi/pi-team/identities.json` 优先，其次 `.pi/pi-team/models.json`（旧格式），再次全局 `~/.pi/agent/pi-team-identities.json`；都没有时 `identity` 档位不可用。
-- **默认模型**：不传 `identity` 时，新角色直接使用主对话当前模型（所有角色默认同一模型）；传了 `identity` 才从档位池解析模型，未知档位拒绝。
+- **配置位置**：项目 `.pi/pi-team/identities.json` 优先，其次 `.pi/pi-team/models.json`（旧格式），再次全局 `~/.pi/agent/pi-team-identities.json`；都没有时只有内置档位 `inherited` 可用。
+- **内置档位 `inherited`**：永远可用，表示「主对话当前模型」。不配置档位池时，`team_models` 只返回这一行（带主模型 pattern），委派时传 `identity: "inherited"` 与不传 `identity` 完全等价——两者都会用主模型 spawn，只是前者是显式、可写入记录的写法。只需要一个模型时不要写六个相同档位，留空用 `inherited` 即可；如果所有档位都指向同一个模型，`team_models` 会提示改用 `inherited`。显式在档位池里定义 `inherited` 会覆盖内置含义。
+- **默认模型**：不传 `identity` 时，新角色直接使用主对话当前模型（所有角色默认同一模型）；传了 `identity` 才从档位池解析模型，未知档位拒绝（错误会提示可用的 `inherited`）。
 - `/boss --identity <档位> <任务>` 可给 Boss 自己指定档位。
 - Lead 创建 Worker 前先调用 `team_models`。普通实现、调查和测试优先 medium，简单、边界明确、低风险任务选 low，只有复杂推理或高难执行才选 high；每个档位中，需要视觉证据时选 vision，否则选 text。Lead 通常选 high（`vision-high` 或 `text-high`）。
-- 只能传 `team_models` 实际返回的档位；不要臆造不存在的 identity。
+- 只能传 `team_models` 实际返回的档位；不要臆造不存在的 identity。`inherited` 虽然不来自档位池配置，但始终有效，且 `team_models` 会把它列出来。
 - 模型 pattern 格式与 `pi --model` 一致（`provider/id` 或 `provider/id:thinking`）。档位随 AgentRecord 持久化，重启恢复后重新解析池。
 
 ## 设计细节

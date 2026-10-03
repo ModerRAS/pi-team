@@ -145,10 +145,16 @@ try {
 	const latest = JSON.parse(readFileSync(join(cwd, ".pi", "pi-team", "latest.json"), "utf8"));
 	teamAgentDir = join(cwd, ".pi", "pi-team", latest.storageId, "agents");
 	const bossConfig = JSON.parse(readFileSync(resolve(teamAgentDir, "boss-1/instance.json"), "utf8"));
+	const identities = await postAs(bossConfig, "/identities", {});
+	const inherited = (identities.identities ?? []).find((row) => row.identity === "inherited");
+	if (!inherited?.pattern) throw new Error("/identities did not expose the built-in inherited identity with a resolved main model");
+	if (!inherited.inherited) throw new Error("The inherited identity row was not marked as the built-in one");
 	const lead = (await postAs(bossConfig, "/delegate", { task: "Capacity smoke lead; wait for direction.", reason: "Exercise the explicit maximum-capacity control path.", name: "Capacity Lead" })).agent;
 	const leadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${lead.agentId}/instance.json`), "utf8"));
-	const workers = await Promise.all(Array.from({ length: 4 }, (_, index) => postAs(leadConfig, "/delegate", { task: `Capacity smoke worker ${index + 1}; wait for direction.`, reason: `Verify concurrent Worker slot ${index + 1} remains available for complex tasks.` })));
+	const workers = await Promise.all(Array.from({ length: 4 }, (_, index) => postAs(leadConfig, "/delegate", { task: `Capacity smoke worker ${index + 1}; wait for direction.`, reason: `Verify concurrent Worker slot ${index + 1} remains available for complex tasks.`, ...(index === 0 ? { identity: "inherited" } : {}) })));
 	if (new Set(workers.map((result) => result.agent.agentId)).size !== 4) throw new Error("Worker IDs were not unique");
+	if (workers[0].agent.identity !== "inherited") throw new Error("Explicit inherited identity was not persisted on the Worker record");
+	if (!workers[0].agent.model || workers[0].agent.model !== lead.model) throw new Error(`inherited identity spawned ${workers[0].agent.model} instead of the main model ${lead.model}`);
 	const workerConfigs = workers.map((result) => JSON.parse(readFileSync(resolve(teamAgentDir, `${result.agent.agentId}/instance.json`), "utf8")));
 	const crossLead = (await postAs(bossConfig, "/delegate", { task: "Cross-branch messaging smoke lead; wait for direction.", reason: "Create a second department to verify same-Team cross-branch messaging.", name: "Capacity Lead" })).agent;
 	const crossLeadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${crossLead.agentId}/instance.json`), "utf8"));
@@ -212,7 +218,7 @@ try {
 	if (!entries.some((entry) => entry.customType === "pi-team-state" && entry.data?.focusedBossId === "boss-1")) throw new Error("Focused Boss was not persisted");
 	if (events.some((event) => event.type === "non-json")) throw new Error("RPC stdout contained non-JSON output");
 	if (stderr.trim()) throw new Error(`Supervisor stderr was not empty: ${stderr.trim()}`);
-	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
+	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states inherited=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
 } finally {
 	for (const item of pending.values()) {
 		clearTimeout(item.timer);
