@@ -3,13 +3,15 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { createProcessJob, type ProcessJob } from "./windows-job.ts";
 import {
+	INHERITED_IDENTITY,
+	INSPECTION_INTERVAL_MS,
 	MAX_CHILDREN,
 	TEAM_EVENT_ENTRY,
 	TEAM_INSTANCE_FLAG,
@@ -17,6 +19,7 @@ import {
 	childCapacityError,
 	formatAgentTree,
 	formatIdentityUsageLine,
+	formatStatusLines,
 	formatTokenUsage,
 	getMessageText,
 	identityRows,
@@ -28,6 +31,7 @@ import {
 	resolveSpawnModel,
 	sendRpcPrompt,
 	sumTokenUsage,
+	taskSummary,
 	undispatchedTargets,
 	unansweredMessages,
 	writeJsonAtomic,
@@ -38,6 +42,7 @@ import {
 	type TeamInstanceConfig,
 	type TeamRole,
 	type TeamSnapshot,
+	type TeamStatusRow,
 } from "./shared.ts";
 
 const MAX_BOSSES = 3;
@@ -46,8 +51,8 @@ const TEAM_WIDGET_KEY = "pi-team-agents";
 const RECOVERY_LIMIT = 3;
 const ROLE_NAMES: Record<TeamRole, string> = { boss: "Boss", lead: "Lead", worker: "Worker" };
 const ROLE_PROMPTS: Record<TeamRole, string> = {
-	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. Team capacity is a safety ceiling, never a target. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
-	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. Team capacity is a safety ceiling, never a target. Before adding another Worker, call team_list and explain why existing Workers cannot handle it.`,
+	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. Team capacity is a safety ceiling, never a target. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. team_list reports state by default; request mode "full" only when you need a role's brief text. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
+	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. Team capacity is a safety ceiling, never a target. Before adding another Worker, call team_list and explain why existing Workers cannot handle it. team_list reports state by default; request mode "full" only when you need a role's brief text.`,
 	worker: `You are a Worker in a Pi coding team. Execute the concrete task assigned to you using the full Pi tool environment. You receive only task-relevant messages. Explain your next actions and findings normally; your text is visible to your Department Lead and the user. Ask your Lead when blocked. You cannot create other agents.`,
 };
 
@@ -86,6 +91,8 @@ interface RuntimeAgent extends AgentRecord {
 	dispatchWarnedFor?: string;
 	intentionalStop: boolean;
 	lastAssistantText: string;
+	lastEventAt?: number;
+	lastSettleHadReport?: boolean;
 	pendingParentMessages: string[];
 	progressTimer?: ReturnType<typeof setTimeout>;
 	process?: ChildProcessWithoutNullStreams;
@@ -309,7 +316,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	function publicAgent(agent: RuntimeAgent): AgentRecord {
-		const { artifactNudged: _artifactNudged, configPath: _configPath, details: _details, dispatchWarnedFor: _dispatchWarnedFor, intentionalStop: _intentionalStop, lastAssistantText: _lastAssistantText, pendingParentMessages: _pendingParentMessages, progressTimer: _progressTimer, process: _process, recoveryAttempts: _recoveryAttempts, rpc: _rpc, runTools: _runTools, token: _token, ...record } = agent;
+		const { artifactNudged: _artifactNudged, configPath: _configPath, details: _details, dispatchWarnedFor: _dispatchWarnedFor, intentionalStop: _intentionalStop, lastAssistantText: _lastAssistantText, lastEventAt: _lastEventAt, lastSettleHadReport: _lastSettleHadReport, pendingParentMessages: _pendingParentMessages, progressTimer: _progressTimer, process: _process, recoveryAttempts: _recoveryAttempts, rpc: _rpc, runTools: _runTools, token: _token, ...record } = agent;
 		return { ...record, path: agentPath(agent.agentId) };
 	}
 
@@ -549,6 +556,8 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 					details: [],
 					intentionalStop: false,
 					lastAssistantText: "",
+					lastEventAt: undefined,
+					lastSettleHadReport: undefined,
 					pendingParentMessages: [],
 					process: undefined,
 					recoveryAttempts: 0,
@@ -583,9 +592,16 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	function buildInitialPrompt(agent: RuntimeAgent, recovering: boolean): string {
+		// The brief lives in the system prompt; repeating it here would put a second full copy in the child's session.
 		return recovering
-			? `Your Pi Team process was restarted unexpectedly. Continue the same task after checking the current session and workspace state. Do not blindly repeat side effects.\n\nTask: ${agent.task}`
-			: `Begin your assigned Pi Team role now.\n\nTask: ${agent.task}`;
+			? "Your Pi Team process was restarted unexpectedly. Continue the same task after checking the current session and workspace state. Do not blindly repeat side effects. Your task is in the system prompt."
+			: "Begin your assigned Pi Team role now. Your task is in the system prompt.";
+	}
+
+	/** Provenance for a brief that stays out of the event log: the delegator's own history, instance.json, and the child session hold the full text. */
+	function briefReference(agent: RuntimeAgent): string {
+		const configPath = context ? relative(context.cwd, agent.configPath).replace(/\\/g, "/") : agent.configPath;
+		return `brief ${agent.task.length} chars, ${configPath}`;
 	}
 
 	function addDetail(agent: RuntimeAgent, line: string): void {
@@ -647,7 +663,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			});
 			void notifyParent(agent, hadProgress ? "New worker inspection events and assistant text are available in formal Team events." : "New worker inspection events are available; the Worker is still running without new assistant text.");
 			scheduleWorkerInspection(agent);
-		}, 10 * 60_000);
+		}, INSPECTION_INTERVAL_MS);
 	}
 
 	/** A composed directive that never reached a channel is invisible; flag it at settle instead of waiting for the subordinate to go quiet. */
@@ -689,12 +705,14 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	function onRpcEvent(agent: RuntimeAgent, event: any): void {
+		agent.lastEventAt = Date.now();
 		switch (event.type) {
 			case "agent_start":
 				agent.status = "running";
 				agent.runCount = (agent.runCount ?? 0) + 1;
 				agent.runTools = [];
 				agent.lastAssistantText = "";
+				agent.lastSettleHadReport = undefined;
 				scheduleWorkerInspection(agent);
 				persistState();
 				addDetail(agent, "agent started");
@@ -737,6 +755,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				flagUndispatchedDirective(agent);
 				const hadReport = agent.pendingParentMessages.length > 0;
 				agent.pendingParentMessages.length = 0;
+				agent.lastSettleHadReport = hadReport;
 				appendEvent({
 					actorId: "supervisor",
 					content: `${agentPath(agent.agentId)} settled and is idle`,
@@ -914,7 +933,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			}
 		});
 		await waitForReady(agent);
-		appendEvent({ actorId: "supervisor", content: `${agentPath(agent.agentId)} [${agent.role}] started: ${agent.task}`, departmentId: agent.departmentId, kind: "status", targetIds: agent.parentId ? [agent.parentId] : [] });
+		appendEvent({ actorId: "supervisor", content: `${agentPath(agent.agentId)} [${agent.role}] started: "${taskSummary(agent.task)}" (${briefReference(agent)})`, departmentId: agent.departmentId, kind: "status", targetIds: agent.parentId ? [agent.parentId] : [] });
 		await deliver(agent, buildInitialPrompt(agent, recovering));
 		updateUi();
 	}
@@ -961,7 +980,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		const agentId = `${role}-${index}`;
 		const departmentId = role === "lead" ? agentId : role === "worker" ? parent?.departmentId : undefined;
 		const agent: RuntimeAgent = {
-			actorEpoch: randomUUID(), agentId, artifactNudged: false, configPath: "", departmentId, details: [], identity: identityKey, intentionalStop: false, lastAssistantText: "", model,
+			actorEpoch: randomUUID(), agentId, artifactNudged: false, configPath: "", departmentId, details: [], identity: identityKey, intentionalStop: false, lastAssistantText: "", lastEventAt: undefined, model,
 			name: name?.trim() || `${ROLE_NAMES[role]} ${index}`, parentId, pendingParentMessages: [], progressTimer: undefined, recoveryAttempts: 0, role, runCount: 0, runTools: [],
 			status: "starting", task: task.trim(), token: randomBytes(24).toString("hex"),
 		};
@@ -1029,10 +1048,33 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		return list.map((agent) => agent.agentId);
 	}
 
+	function visibleAgentRecords(requester: RuntimeAgent): RuntimeAgent[] {
+		if (requester.role === "boss") return [...agents.values()].filter((agent) => agent.agentId === requester.agentId || agent.parentId === requester.agentId || (agent.parentId && agents.get(agent.parentId)?.parentId === requester.agentId));
+		if (requester.role === "lead") return [...agents.values()].filter((agent) => agent.agentId === requester.agentId || agent.parentId === requester.agentId);
+		return [requester];
+	}
+
 	function visibleAgents(requester: RuntimeAgent): AgentRecord[] {
-		if (requester.role === "boss") return [...agents.values()].filter((agent) => agent.agentId === requester.agentId || agent.parentId === requester.agentId || (agent.parentId && agents.get(agent.parentId)?.parentId === requester.agentId)).map(publicAgent);
-		if (requester.role === "lead") return [...agents.values()].filter((agent) => agent.agentId === requester.agentId || agent.parentId === requester.agentId).map(publicAgent);
-		return [publicAgent(requester)];
+		return visibleAgentRecords(requester).map(publicAgent);
+	}
+
+	/** State-only view: no task text, so a status poll costs the same whether briefs are short or huge. */
+	function statusRow(agent: RuntimeAgent): TeamStatusRow {
+		return {
+			agentId: agent.agentId,
+			artifacts: agent.artifacts?.length ? agent.artifacts : undefined,
+			departmentId: agent.departmentId,
+			identity: agent.identity,
+			lastEventAgeMs: agent.lastEventAt && agent.status !== "starting" ? Date.now() - agent.lastEventAt : undefined,
+			model: agent.model,
+			noReport: agent.status === "idle" && agent.lastSettleHadReport === false ? true : undefined,
+			parentId: agent.parentId,
+			path: agentPath(agent.agentId),
+			role: agent.role,
+			runCount: agent.runCount ?? 0,
+			status: agent.status,
+			taskSummary: taskSummary(agent.task),
+		};
 	}
 
 	function canMessage(actor: RuntimeAgent, target: RuntimeAgent): boolean {
@@ -1078,14 +1120,14 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				if (!task) throw new Error("Delegated task is required");
 				if (!reason) throw new Error("Delegation reason is required");
 				const agent = await createAgent(role, task, actor.agentId, typeof data.name === "string" ? data.name : undefined, typeof data.identity === "string" ? data.identity : undefined);
-				appendEvent({
+				const assignment = appendEvent({
 					actorId: actor.agentId,
-					content: `Delegated ${agentPath(agent.agentId)}: ${reason}`,
+					content: `Delegated ${agentPath(agent.agentId)} "${taskSummary(task)}" (${task.length} chars, ${agent.identity ?? INHERITED_IDENTITY}): ${truncate(reason, 160)}`,
 					departmentId: agent.departmentId,
 					kind: "assignment",
 					targetIds: [agent.agentId],
 				});
-				return json(res, 200, { agent: publicAgent(agent) });
+				return json(res, 200, { agent: publicAgent(agent), eventId: assignment.eventId, seq: assignment.seq, timestamp: assignment.timestamp });
 			}
 			if (req.url === "/send") {
 				const target = resolveAgent(String(data.target || ""), true);
@@ -1118,7 +1160,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			}
 			if (req.url === "/cancel") return json(res, 200, { cancelled: await cancelAgent(String(data.target || ""), actor) });
 			if (req.url === "/events") return json(res, 200, { events: roleVisibleEvents(actor, data.drillDown === true).slice(-Math.max(1, Math.min(100, Number(data.limit) || 30))) });
-			if (req.url === "/list") return json(res, 200, { agents: visibleAgents(actor) });
+			if (req.url === "/list") return json(res, 200, data.mode === "full" ? { agents: visibleAgents(actor), mode: "full" } : { agents: visibleAgentRecords(actor).map(statusRow), mode: "status" });
 			if (req.url === "/identities") return json(res, 200, { models: modelPool, identities: identityRows(modelPool, context?.model) });
 			return json(res, 404, { error: "Not found" });
 		} catch (error) {
@@ -1187,7 +1229,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		try { await cancelAgent(args.trim()); } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
 	}});
 	pi.registerCommand("agents", { description: "List Pi Team agents", handler: async (_args, ctx) => {
-		ctx.ui.notify([...agents.values()].map((agent) => `${agentPath(agent.agentId)} [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n") || "No agents.", "info");
+		ctx.ui.notify(formatStatusLines([...agents.values()].map(statusRow)).join("\n") || "No agents.", "info");
 	}});
 	pi.registerCommand("view", { description: "View recent formal group-chat events", handler: async (args, ctx) => {
 		const requested = Number.parseInt(args.trim(), 10);

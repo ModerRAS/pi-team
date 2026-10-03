@@ -149,14 +149,17 @@ try {
 	const inherited = (identities.identities ?? []).find((row) => row.identity === "inherited");
 	if (!inherited?.pattern) throw new Error("/identities did not expose the built-in inherited identity with a resolved main model");
 	if (!inherited.inherited) throw new Error("The inherited identity row was not marked as the built-in one");
-	const lead = (await postAs(bossConfig, "/delegate", { task: "Capacity smoke lead; wait for direction.", reason: "Exercise the explicit maximum-capacity control path.", name: "Capacity Lead" })).agent;
+	const leadResult = await postAs(bossConfig, "/delegate", { task: "Capacity smoke lead; wait for direction.", reason: "Exercise the explicit maximum-capacity control path.", name: "Capacity Lead" });
+	const lead = leadResult.agent;
+	if (!leadResult.seq || !leadResult.eventId || !leadResult.timestamp) throw new Error("team_delegate did not return a dispatch receipt");
 	const leadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${lead.agentId}/instance.json`), "utf8"));
 	const workers = await Promise.all(Array.from({ length: 4 }, (_, index) => postAs(leadConfig, "/delegate", { task: `Capacity smoke worker ${index + 1}; wait for direction.`, reason: `Verify concurrent Worker slot ${index + 1} remains available for complex tasks.`, ...(index === 0 ? { identity: "inherited" } : {}) })));
 	if (new Set(workers.map((result) => result.agent.agentId)).size !== 4) throw new Error("Worker IDs were not unique");
 	if (workers[0].agent.identity !== "inherited") throw new Error("Explicit inherited identity was not persisted on the Worker record");
 	if (!workers[0].agent.model || workers[0].agent.model !== lead.model) throw new Error(`inherited identity spawned ${workers[0].agent.model} instead of the main model ${lead.model}`);
 	const workerConfigs = workers.map((result) => JSON.parse(readFileSync(resolve(teamAgentDir, `${result.agent.agentId}/instance.json`), "utf8")));
-	const crossLead = (await postAs(bossConfig, "/delegate", { task: "Cross-branch messaging smoke lead; wait for direction.", reason: "Create a second department to verify same-Team cross-branch messaging.", name: "Capacity Lead" })).agent;
+	const crossLeadTask = "Cross-branch messaging smoke lead; wait for direction.\n\nMARKER_DO_NOT_ECHO_9f2c: this brief body must never be copied into a team event.";
+	const crossLead = (await postAs(bossConfig, "/delegate", { task: crossLeadTask, reason: "Create a second department to verify same-Team cross-branch messaging.", name: "Capacity Lead" })).agent;
 	const crossLeadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${crossLead.agentId}/instance.json`), "utf8"));
 	const crossWorker = (await postAs(crossLeadConfig, "/delegate", { task: "Cross-branch messaging smoke worker; wait for direction.", reason: "Provide a Worker under a different Lead for messaging verification.", name: "Cross Branch Worker" })).agent;
 	const crossWorkerConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${crossWorker.agentId}/instance.json`), "utf8"));
@@ -185,6 +188,20 @@ try {
 	const messagingEntries = await waitForEntry((items) => Object.values(messages).every((message) => items.some((entry) => entry.customType === "pi-team-event" && entry.data?.kind === "message" && entry.data?.content === message)));
 	const crossMessage = messagingEntries.find((entry) => entry.customType === "pi-team-event" && entry.data?.content === messages.crossWorker);
 	if (crossMessage?.data?.actorId !== workers[0].agent.agentId || crossMessage.data.targetIds?.[0] !== crossWorker.agentId) throw new Error("Cross-worker group-chat event lost authenticated actor or target identity");
+
+	const statusList = await postAs(leadConfig, "/list", {});
+	const statusLead = statusList.agents.find((agent) => agent.agentId === lead.agentId);
+	if (statusList.mode !== "status" || !statusLead?.taskSummary || "task" in statusLead) throw new Error("/list default mode still returns the full task text");
+	const fullList = await postAs(leadConfig, "/list", { mode: "full" });
+	const fullLead = fullList.agents.find((agent) => agent.agentId === lead.agentId);
+	if (fullList.mode !== "full" || fullLead?.task !== "Capacity smoke lead; wait for direction.") throw new Error("/list mode full no longer returns the delegated task text");
+	const eventLog = readFileSync(join(cwd, ".pi", "pi-team", latest.storageId, "events.jsonl"), "utf8").split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+	const harnessEvents = eventLog.filter((event) => event.kind !== "message");
+	if (harnessEvents.some((event) => String(event.content).includes("MARKER_DO_NOT_ECHO_9f2c"))) throw new Error("a harness event echoed the delegated brief body");
+	const assignment = harnessEvents.find((event) => event.kind === "assignment" && event.targetIds?.[0] === crossLead.agentId);
+	if (!assignment || !/\(\d+ chars, /.test(assignment.content)) throw new Error("assignment event does not carry a brief reference instead of the body");
+	const started = harnessEvents.find((event) => event.actorId === "supervisor" && String(event.content).includes(`${crossLead.agentId} [lead] started:`));
+	if (!started || !/brief \d+ chars, /.test(started.content)) throw new Error("started event does not carry a brief reference instead of the body");
 
 	if (!parentChildSend.seq || !parentChildSend.eventId || !parentChildSend.timestamp) throw new Error("team_send did not return a dispatch receipt");
 	const escalation = await postAs(workerConfigs[0], "/escalate", { reason: "Smoke: verify the structured escalation path reaches the parent.", needed: "write" });
@@ -218,7 +235,7 @@ try {
 	if (!entries.some((entry) => entry.customType === "pi-team-state" && entry.data?.focusedBossId === "boss-1")) throw new Error("Focused Boss was not persisted");
 	if (events.some((event) => event.type === "non-json")) throw new Error("RPC stdout contained non-JSON output");
 	if (stderr.trim()) throw new Error(`Supervisor stderr was not empty: ${stderr.trim()}`);
-	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states inherited=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
+	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states inherited=ok listStatus=ok+full briefRefs=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
 } finally {
 	for (const item of pending.values()) {
 		clearTimeout(item.timer);

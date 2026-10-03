@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { formatIdentityLines } from "./runtime.ts";
-export { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TokenUsage } from "./runtime.ts";
+import { formatIdentityLines, formatStatusLines, taskSummary, type TeamStatusRow } from "./runtime.ts";
+export { BUILTIN_IDENTITIES, INHERITED_IDENTITY, INSPECTION_INTERVAL_MS, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, taskSummary, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TeamStatusRow, type TokenUsage } from "./runtime.ts";
 
 export type TeamRole = "boss" | "lead" | "worker";
 export type AgentStatus = "starting" | "running" | "idle" | "recovering" | "cancelled" | "failed";
@@ -205,11 +205,13 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 					"For a new set of non-conflicting tasks, create a Lead for each task in parallel by default; use one Lead only when the work is truly one coherent workstream.",
 					"Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace.",
 					"Call team_models before delegation. Leads normally use high: choose vision-high only for visual or GUI evidence, otherwise text-high; pass only an available identity.",
+					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
 				]
 				: [
 					"Do not implement substantive Worker tasks yourself; coordinate, review, and delegate execution.",
 					"Use one Worker for one coherent task and add more only for genuinely independent parallel work.",
 					"Call team_models before delegation. Prefer medium for ordinary work, low for simple bounded work, and high only for genuinely complex work; choose vision only for visual or GUI evidence, otherwise text.",
+					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
 				],
 			parameters: Type.Object({
 				task: Type.String({ description: "Concrete delegated task with a verifiable outcome" }),
@@ -218,10 +220,10 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers; \"inherited\" means the main session model" })),
 			}),
 			async execute(_id, params) {
-				const result = await request<{ agent: AgentRecord }>(config, "/delegate", params);
+				const result = await request<{ agent: AgentRecord; eventId: string; seq: number; timestamp: string }>(config, "/delegate", params);
 				const reminder = params.identity ? "" : "\nNote: no identity was passed; call team_models and re-delegate with an identity if you have not.";
 				return {
-					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId}: ${result.agent.task}${reminder}` }],
+					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId} "${taskSummary(result.agent.task)}" (brief ${result.agent.task.length} chars) as #${result.seq}.${reminder}` }],
 					details: result,
 				};
 			},
@@ -292,11 +294,16 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 	pi.registerTool({
 		name: "team_list",
 		label: "Team List",
-		description: "List the Pi Team roles you are allowed to see.",
-		parameters: Type.Object({}),
-		async execute() {
-			const result = await request<{ agents: AgentRecord[] }>(config, "/list", {});
-			const text = result.agents.map((agent) => `${agent.path || agent.agentId} [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n");
+		description: "List the Pi Team roles you are allowed to see. Status mode (default) reports id, role, state, identity, last activity and a one-line task summary; pass mode \"full\" only when you need each role's complete brief text, which is already in your own delegation history.",
+		parameters: Type.Object({
+			mode: Type.Optional(Type.Union([Type.Literal("status"), Type.Literal("full")], { description: "status (default): state only; full: include the complete delegated brief per role" })),
+		}),
+		async execute(_id, params) {
+			const mode = params.mode === "full" ? "full" : "status";
+			const result = await request<{ agents: TeamStatusRow[] | AgentRecord[]; mode: string }>(config, "/list", { mode });
+			const text = mode === "full"
+				? (result.agents as AgentRecord[]).map((agent) => `${agent.path || agent.agentId} [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n")
+				: formatStatusLines(result.agents as TeamStatusRow[]).join("\n");
 			return { content: [{ type: "text", text: text || "No team agents." }], details: result };
 		},
 	});
