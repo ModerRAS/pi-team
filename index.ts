@@ -14,6 +14,7 @@ import {
 	TEAM_EVENT_ENTRY,
 	TEAM_INSTANCE_FLAG,
 	TEAM_STATE_ENTRY,
+	childCapacityError,
 	formatAgentTree,
 	formatIdentityUsageLine,
 	formatTokenUsage,
@@ -26,6 +27,8 @@ import {
 	resolveSpawnModel,
 	sendRpcPrompt,
 	sumTokenUsage,
+	undispatchedTargets,
+	unansweredMessages,
 	writeJsonAtomic,
 	type AgentRecord,
 	type AgentStatus,
@@ -76,14 +79,18 @@ interface RpcResponse {
 }
 
 interface RuntimeAgent extends AgentRecord {
+	artifactNudged: boolean;
 	configPath: string;
 	details: string[];
+	dispatchWarnedFor?: string;
 	intentionalStop: boolean;
+	lastAssistantText: string;
 	pendingParentMessages: string[];
 	progressTimer?: ReturnType<typeof setTimeout>;
 	process?: ChildProcessWithoutNullStreams;
 	recoveryAttempts: number;
 	rpc?: RpcClient;
+	runTools: string[];
 	token: string;
 }
 
@@ -301,7 +308,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	function publicAgent(agent: RuntimeAgent): AgentRecord {
-		const { configPath: _configPath, details: _details, intentionalStop: _intentionalStop, pendingParentMessages: _pendingParentMessages, progressTimer: _progressTimer, process: _process, recoveryAttempts: _recoveryAttempts, rpc: _rpc, token: _token, ...record } = agent;
+		const { artifactNudged: _artifactNudged, configPath: _configPath, details: _details, dispatchWarnedFor: _dispatchWarnedFor, intentionalStop: _intentionalStop, lastAssistantText: _lastAssistantText, pendingParentMessages: _pendingParentMessages, progressTimer: _progressTimer, process: _process, recoveryAttempts: _recoveryAttempts, rpc: _rpc, runTools: _runTools, token: _token, ...record } = agent;
 		return { ...record, path: agentPath(agent.agentId) };
 	}
 
@@ -536,14 +543,17 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				agents.set(record.agentId, {
 					...record,
 					actorEpoch: randomUUID(),
+					artifactNudged: false,
 					configPath: "",
 					details: [],
 					intentionalStop: false,
+					lastAssistantText: "",
 					pendingParentMessages: [],
 					process: undefined,
 					recoveryAttempts: 0,
 					rpc: undefined,
 					runCount: record.runCount ?? 0,
+					runTools: [],
 					status: "recovering",
 					token: randomBytes(24).toString("hex"),
 				});
@@ -600,7 +610,15 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			.filter((event) => event.seq > (agent.lastContextSeq ?? 0) && event.actorId !== agent.agentId)
 			.map((event) => `#${event.seq} ${agentPath(event.actorId)} [${event.kind}]: ${event.content}`)
 			.join("\n");
-		const enriched = unseen ? `Formal Team events since your previous wake:\n${unseen}\n\nIncoming wake signal:\n${message}` : message;
+		// Written and woken is not read and acted on; the sender only sees the difference here.
+		const unanswered = unansweredMessages(events, agent.agentId)
+			.map((event) => `#${event.seq} -> ${event.targetIds.map(agentPath).join(", ")} at ${event.timestamp}: delivered, no event from the target since`)
+			.join("\n");
+		const sections = [
+			unseen ? `Formal Team events since your previous wake:\n${unseen}` : "",
+			unanswered ? `Messages you sent with no subsequent target activity:\n${unanswered}\nWait for that activity or re-send once; do not assume the target acted.` : "",
+		].filter(Boolean);
+		const enriched = sections.length ? `${sections.join("\n\n")}\n\nIncoming wake signal:\n${message}` : message;
 		await sendRpcPrompt(agent.rpc, enriched);
 		agent.lastContextSeq = Math.max(agent.lastContextSeq ?? 0, throughSeq);
 		persistState();
@@ -631,6 +649,22 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		}, 10 * 60_000);
 	}
 
+	/** A composed directive that never reached a channel is invisible; flag it at settle instead of waiting for the subordinate to go quiet. */
+	function flagUndispatchedDirective(agent: RuntimeAgent): void {
+		if (agent.role === "worker" || !agent.lastAssistantText) return;
+		const subordinates = [...agents.values()]
+			.filter((child) => child.parentId === agent.agentId && child.status !== "cancelled")
+			.map((child) => ({ agentId: child.agentId, path: agentPath(child.agentId) }));
+		const targets = undispatchedTargets(agent.lastAssistantText, subordinates, agent.runTools);
+		if (!targets.length || agent.dispatchWarnedFor === agent.lastAssistantText) return;
+		agent.dispatchWarnedFor = agent.lastAssistantText;
+		const warning = `This turn named ${targets.join(", ")} but called neither team_send nor team_delegate`;
+		addDetail(agent, warning);
+		appendEvent({ actorId: "supervisor", content: `${warning}. Composing a directive is not dispatching it.`, departmentId: agent.departmentId, kind: "error", targetIds: [agent.agentId] });
+		void deliver(agent, `${warning}. If that reply was a directive it was never delivered: dispatch it now with team_send. If it was only a report, reply "no dispatch needed".`)
+			.catch((error) => addDetail(agent, `dispatch check delivery failed: ${error instanceof Error ? error.message : String(error)}`));
+	}
+
 	async function notifyParent(agent: RuntimeAgent, message: string): Promise<void> {
 		const parent = parentOf(agent);
 		if (!parent || parent.status === "cancelled") return;
@@ -658,17 +692,48 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			case "agent_start":
 				agent.status = "running";
 				agent.runCount = (agent.runCount ?? 0) + 1;
+				agent.runTools = [];
+				agent.lastAssistantText = "";
 				scheduleWorkerInspection(agent);
 				persistState();
 				addDetail(agent, "agent started");
 				break;
 			case "agent_settled": {
-				agent.status = "idle";
 				if (agent.progressTimer) clearTimeout(agent.progressTimer);
 				agent.progressTimer = undefined;
-				addDetail(agent, "agent settled");
 				refreshTokenUsage(agent);
+				const missing = (agent.artifacts ?? []).filter((artifact) => !existsSync(resolve(context?.cwd ?? process.cwd(), artifact)));
+				if (missing.length) {
+					// A declared artifact that is absent turns a plausible "delivered" report into a hard failure.
+					addDetail(agent, `settled without required artifact(s): ${missing.join(", ")}`);
+					appendEvent({
+						actorId: "supervisor",
+						content: `${agentPath(agent.agentId)} settled without required artifact(s): ${missing.join(", ")}`,
+						departmentId: agent.departmentId,
+						kind: "error",
+						targetIds: agent.parentId ? [agent.parentId] : [],
+					});
+					persistState();
+					if (agent.artifactNudged) {
+						agent.status = "failed";
+						persistState();
+						void notifyParent(agent, "New subordinate artifact-failure events need attention in formal Team events.");
+					} else {
+						agent.artifactNudged = true;
+						agent.status = "running";
+						void deliver(agent, `Required artifact(s) still missing: ${missing.join(", ")}. Create them now, or reply with why they cannot be created.`)
+							.catch((error) => { agent.status = "failed"; addDetail(agent, `artifact check delivery failed: ${error instanceof Error ? error.message : String(error)}`); persistState(); });
+					}
+					break;
+				}
+				if (agent.artifacts?.length) {
+					agent.artifacts = [];
+					agent.artifactNudged = false;
+				}
+				agent.status = "idle";
+				addDetail(agent, "agent settled");
 				persistState();
+				flagUndispatchedDirective(agent);
 				const hadReport = agent.pendingParentMessages.length > 0;
 				agent.pendingParentMessages.length = 0;
 				appendEvent({
@@ -682,7 +747,10 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				break;
 			}
 			case "message_end":
-				if (event.message?.role === "assistant") void publishAssistantText(agent, getMessageText(event.message));
+				if (event.message?.role === "assistant") {
+					agent.lastAssistantText = getMessageText(event.message);
+					void publishAssistantText(agent, agent.lastAssistantText);
+				}
 				if (event.message?.usage) {
 					addTokenUsage(agent, event.message.usage);
 					persistState();
@@ -696,6 +764,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				break;
 			case "tool_execution_end":
 				addDetail(agent, `tool ${event.toolName} ${event.isError ? "failed" : "done"}`);
+				if (typeof event.toolName === "string" && !agent.runTools.includes(event.toolName)) agent.runTools.push(event.toolName);
 				break;
 			case "queue_update":
 				addDetail(agent, `queue steer=${event.steering?.length ?? 0} follow=${event.followUp?.length ?? 0}`);
@@ -878,7 +947,10 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	async function createAgent(role: TeamRole, task: string, parentId?: string, name?: string, identity?: string): Promise<RuntimeAgent> {
 		await startupPromise;
 		if (role === "boss" && [...agents.values()].filter((a) => a.role === "boss" && a.status !== "cancelled").length >= MAX_BOSSES) throw new Error(`Maximum Boss count is ${MAX_BOSSES}`);
-		if (parentId && childCount(parentId) >= MAX_CHILDREN) throw new Error(`${parentId} already has ${MAX_CHILDREN} active children`);
+		if (parentId && childCount(parentId) >= MAX_CHILDREN) {
+			const siblings = [...agents.values()].filter((agent) => agent.parentId === parentId && agent.status !== "cancelled");
+			throw new Error(childCapacityError(parentId, siblings));
+		}
 		const parent = parentId ? agents.get(parentId) : undefined;
 		if (role === "lead" && parent?.role !== "boss") throw new Error("Only a Boss can own a Department Lead");
 		if (role === "worker" && parent?.role !== "lead") throw new Error("Only a Department Lead can own a Worker");
@@ -888,8 +960,8 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		const agentId = `${role}-${index}`;
 		const departmentId = role === "lead" ? agentId : role === "worker" ? parent?.departmentId : undefined;
 		const agent: RuntimeAgent = {
-			actorEpoch: randomUUID(), agentId, configPath: "", departmentId, details: [], identity: identityKey, intentionalStop: false, model,
-			name: name?.trim() || `${ROLE_NAMES[role]} ${index}`, parentId, pendingParentMessages: [], progressTimer: undefined, recoveryAttempts: 0, role, runCount: 0,
+			actorEpoch: randomUUID(), agentId, artifactNudged: false, configPath: "", departmentId, details: [], identity: identityKey, intentionalStop: false, lastAssistantText: "", model,
+			name: name?.trim() || `${ROLE_NAMES[role]} ${index}`, parentId, pendingParentMessages: [], progressTimer: undefined, recoveryAttempts: 0, role, runCount: 0, runTools: [],
 			status: "starting", task: task.trim(), token: randomBytes(24).toString("hex"),
 		};
 		agents.set(agentId, agent);
@@ -1020,9 +1092,28 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				if (!canMessage(actor, target)) throw new Error(`${actor.agentId} may only message another role in the same Pi Team`);
 				const message = String(data.message || "").trim();
 				if (!message) throw new Error("Message is required");
-				appendEvent({ actorId: actor.agentId, content: message, departmentId: actor.departmentId, kind: "message", targetIds: [target.agentId] });
-				await deliver(target, "A new directed Team message is available in formal Team events.");
-				return json(res, 200, { delivered: true });
+				const event = appendEvent({ actorId: actor.agentId, content: message, departmentId: actor.departmentId, kind: "message", targetIds: [target.agentId] });
+				await deliver(target, `A new directed Team message is available in formal Team events (#${event.seq}).`);
+				return json(res, 200, { delivered: true, eventId: event.eventId, seq: event.seq, timestamp: event.timestamp });
+			}
+			if (req.url === "/escalate") {
+				const parent = parentOf(actor);
+				if (!parent || parent.status === "cancelled") throw new Error("No parent is available to escalate to");
+				const reason = String(data.reason || "").trim();
+				if (!reason) throw new Error("Escalation reason is required");
+				const needed = data.needed === "code" ? "code" : "write";
+				const kind = String(data.kind || "mode_change").trim() || "mode_change";
+				const event = appendEvent({ actorId: actor.agentId, content: `Escalation ${kind}: needs ${needed}. ${reason}`, departmentId: actor.departmentId, kind: "control", targetIds: [parent.agentId] });
+				await deliver(parent, `${agentPath(actor.agentId)} escalated (${kind}: needs ${needed}) as #${event.seq}. Provide the capability or an alternative; the subject is blocked until you answer.`);
+				return json(res, 200, { escalated: true, eventId: event.eventId, seq: event.seq });
+			}
+			if (req.url === "/require-artifact") {
+				const artifact = String(data.path || "").trim();
+				if (!artifact) throw new Error("Artifact path is required");
+				actor.artifacts = [...new Set([...(actor.artifacts ?? []), artifact])];
+				actor.artifactNudged = false;
+				persistState();
+				return json(res, 200, { artifacts: actor.artifacts });
 			}
 			if (req.url === "/cancel") return json(res, 200, { cancelled: await cancelAgent(String(data.target || ""), actor) });
 			if (req.url === "/events") return json(res, 200, { events: roleVisibleEvents(actor, data.drillDown === true).slice(-Math.max(1, Math.min(100, Number(data.limit) || 30))) });

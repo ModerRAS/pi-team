@@ -4,6 +4,60 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { BUILTIN_IDENTITIES, formatAgentTree, formatIdentityUsageLine, formatProgress, formatTokenUsage, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic } from "./runtime.ts";
+import { childCapacityError, undispatchedTargets, unansweredMessages } from "./shared.ts";
+
+test("capacity rejection names child states and releasable idle slots", () => {
+	assert.equal(
+		childCapacityError("lead-1", [
+			{ agentId: "worker-64", status: "idle" },
+			{ agentId: "worker-67", status: "idle" },
+			{ agentId: "worker-75", status: "running" },
+			{ agentId: "worker-76", status: "failed" },
+		]),
+		"lead-1 already has 4 active children: worker-64 (idle), worker-67 (idle), worker-75 (running), worker-76 (failed) — 2 idle may be released via team_cancel",
+	);
+	assert.equal(
+		childCapacityError("lead-2", [
+			{ agentId: "worker-1", status: "running" },
+			{ agentId: "worker-2", status: "starting" },
+			{ agentId: "worker-3", status: "recovering" },
+			{ agentId: "worker-4", status: "running" },
+		]),
+		"lead-2 already has 4 active children: worker-1 (running), worker-2 (starting), worker-3 (recovering), worker-4 (running)",
+	);
+});
+
+test("unanswered sends survive until the target produces a later event", () => {
+	const events = [
+		{ actorId: "boss-1", kind: "message", seq: 1, targetIds: ["lead-1"] },
+		{ actorId: "lead-1", kind: "message", seq: 2, targetIds: ["boss-1"] },
+		{ actorId: "boss-1", kind: "message", seq: 3, targetIds: ["lead-1"] },
+		{ actorId: "boss-1", kind: "message", seq: 4, targetIds: [] },
+	];
+
+	assert.deepEqual(unansweredMessages(events, "boss-1").map((event) => event.seq), [3]);
+	assert.deepEqual(unansweredMessages(events, "lead-1").map((event) => event.seq), []);
+	const backlog = Array.from({ length: 5 }, (_, index) => ({ actorId: "lead-2", kind: "message", seq: 10 + index, targetIds: ["worker-9"] }));
+	assert.deepEqual(unansweredMessages([...events, ...backlog], "lead-2").map((event) => event.seq), [12, 13, 14]);
+});
+
+test("dispatch check flags named subordinates unless a dispatch tool ran", () => {
+	const subordinates = [
+		{ agentId: "lead-1", path: "boss-1/lead-1" },
+		{ agentId: "lead-2", path: "boss-1/lead-2" },
+	];
+
+	assert.deepEqual(undispatchedTargets("lead-1: do X next", subordinates, ["team_read"]), ["lead-1"]);
+	assert.deepEqual(undispatchedTargets("lead-1: do X next", subordinates, ["team_send"]), []);
+	assert.deepEqual(undispatchedTargets("lead-1: do X next", subordinates, ["team_delegate"]), []);
+	assert.deepEqual(undispatchedTargets("status: lead-1 is idle", subordinates, []), ["lead-1"]);
+	assert.deepEqual(undispatchedTargets("no subordinate mentioned", subordinates, []), []);
+	assert.deepEqual(undispatchedTargets("", subordinates, []), []);
+	const workers = [{ agentId: "worker-1", path: "boss-1/lead-1/worker-1" }];
+	assert.deepEqual(undispatchedTargets("worker-11 finished", workers, []), []);
+	assert.deepEqual(undispatchedTargets("worker-1 finished", workers, []), ["worker-1"]);
+	assert.deepEqual(undispatchedTargets("boss-1/lead-1/worker-1 now", workers, []), ["worker-1"]);
+});
 
 test("formatProgress accepts preformatted and array progress", () => {
 	const progress = ["first update", "second update"];

@@ -34,6 +34,7 @@ export interface TeamEvent {
 export interface AgentRecord {
 	actorEpoch: string;
 	agentId: string;
+	artifacts?: string[];
 	departmentId?: string;
 	identity?: string;
 	lastContextSeq?: number;
@@ -60,6 +61,45 @@ export const TEAM_INSTANCE_FLAG = "team-instance";
 export const TEAM_EVENT_ENTRY = "pi-team-event";
 export const TEAM_STATE_ENTRY = "pi-team-state";
 export const MAX_CHILDREN = 4;
+
+/** Tools that actually deliver work to a subordinate; prose naming a subordinate is not delivery. */
+export const DISPATCH_TOOLS = ["team_send", "team_delegate"] as const;
+
+/** Capacity rejection that names each child's state, so a releasable idle slot is not mistaken for a hard cap. */
+export function childCapacityError(parentId: string, children: { agentId: string; status: AgentStatus }[]): string {
+	const listed = children.map((child) => `${child.agentId} (${child.status})`).join(", ");
+	const idle = children.filter((child) => child.status === "idle").length;
+	return `${parentId} already has ${children.length} active children: ${listed}${idle ? ` — ${idle} idle may be released via team_cancel` : ""}`;
+}
+
+/** Messages this actor sent whose target produced no later event: the sender cannot see "delivered" as "received". */
+export function unansweredMessages(events: TeamEvent[], actorId: string, limit = 3): TeamEvent[] {
+	const lastSeqByActor = new Map<string, number>();
+	for (const event of events) lastSeqByActor.set(event.actorId, Math.max(lastSeqByActor.get(event.actorId) ?? 0, event.seq));
+	return events
+		.filter((event) => event.actorId === actorId && event.kind === "message" && event.targetIds.length > 0)
+		.filter((event) => event.targetIds.every((target) => (lastSeqByActor.get(target) ?? 0) <= event.seq))
+		.slice(-limit);
+}
+
+/**
+ * Direct subordinates named in `text` by a turn that used no dispatch tool.
+ * Conservative on purpose: id/path tokens only, no imperative-language heuristics.
+ * ponytail: a status report that names a subordinate also matches; the warning is de-duplicated per text instead of parsing intent.
+ */
+export function undispatchedTargets(text: string, subordinates: { agentId: string; path?: string }[], usedTools: Iterable<string>): string[] {
+	const trimmed = text.trim();
+	if (!trimmed) return [];
+	const tools = new Set(usedTools);
+	if (DISPATCH_TOOLS.some((tool) => tools.has(tool))) return [];
+	return subordinates.filter((agent) => namesAgent(trimmed, agent)).map((agent) => agent.agentId);
+}
+
+function namesAgent(text: string, agent: { agentId: string; path?: string }): boolean {
+	const escaped = agent.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	if (new RegExp(`(^|[^\\w-])${escaped}([^\\w-]|$)`).test(text)) return true;
+	return Boolean(agent.path && agent.path !== agent.agentId && text.includes(agent.path));
+}
 
 function normalizeText(value: unknown): string {
 	return typeof value === "string" ? value.trim() : "";
@@ -134,8 +174,8 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 			message: Type.String({ description: "Message to deliver" }),
 		}),
 		async execute(_id, params) {
-			const result = await request<{ delivered: boolean }>(config, "/send", params);
-			return { content: [{ type: "text", text: `Message delivered to ${params.target}.` }], details: result };
+			const result = await request<{ delivered: boolean; eventId: string; seq: number; timestamp: string }>(config, "/send", params);
+			return { content: [{ type: "text", text: `Message delivered to ${params.target} as #${result.seq} at ${result.timestamp}. Delivery is a write, not a read receipt.` }], details: result };
 		},
 	});
 
@@ -182,8 +222,9 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 			}),
 			async execute(_id, params) {
 				const result = await request<{ agent: AgentRecord }>(config, "/delegate", params);
+				const reminder = params.identity ? "" : "\nNote: no identity was passed; call team_models and re-delegate with an identity if you have not.";
 				return {
-					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId}: ${result.agent.task}` }],
+					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId}: ${result.agent.task}${reminder}` }],
 					details: result,
 				};
 			},
@@ -197,6 +238,37 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 			async execute(_id, params) {
 				const result = await request<{ cancelled: string[] }>(config, "/cancel", params);
 				return { content: [{ type: "text", text: `Removed: ${result.cancelled.join(", ")}` }], details: result };
+			},
+		});
+	}
+
+	if (expectedRole !== "boss") {
+		pi.registerTool({
+			name: "team_escalate",
+			label: "Team Escalate",
+			description: "Ask your parent for a capability this run does not have (for example write access while the host blocks writes). This wakes your parent with a structured control event instead of a prose request.",
+			parameters: Type.Object({
+				reason: Type.String({ minLength: 12, description: "What is blocked and what you would do with the capability" }),
+				needed: Type.Optional(Type.Union([Type.Literal("write"), Type.Literal("code")], { description: "Capability you need; defaults to write" })),
+				kind: Type.Optional(Type.String({ description: "Escalation kind; defaults to mode_change" })),
+			}),
+			async execute(_id, params) {
+				const result = await request<{ escalated: boolean; eventId: string; seq: number }>(config, "/escalate", params);
+				return { content: [{ type: "text", text: `Escalated to your parent as #${result.seq}. Do not retry the blocked action until the parent answers.` }], details: result };
+			},
+		});
+
+		pi.registerTool({
+			name: "team_require_artifact",
+			label: "Team Require Artifact",
+			description: "Declare a file this run must produce. Settling while it is still missing is reported to your parent as a hard failure, not as a clean idle settle.",
+			parameters: Type.Object({
+				path: Type.String({ description: "Workspace-relative or absolute file path this run must leave on disk" }),
+				note: Type.Optional(Type.String({ description: "Why this artifact is the deliverable" })),
+			}),
+			async execute(_id, params) {
+				const result = await request<{ artifacts: string[] }>(config, "/require-artifact", params);
+				return { content: [{ type: "text", text: `Artifact obligation recorded: ${params.path}. Settling without it is a failure.` }], details: result };
 			},
 		});
 	}
