@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -10,13 +10,15 @@ import { CONFIG_DIR_NAME, SessionManager, type ExtensionAPI, type ExtensionConte
 import { Box, Text, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 import { createProcessJob, type ProcessJob } from "./windows-job.ts";
 import {
+	ADOPTION_WINDOW_MS,
+	CHILD_SOFT_LIMIT,
 	INHERITED_IDENTITY,
 	INSPECTION_INTERVAL_MS,
-	MAX_CHILDREN,
 	TEAM_EVENT_ENTRY,
 	TEAM_INSTANCE_FLAG,
 	TEAM_STATE_ENTRY,
-	childCapacityError,
+	childCapacityNote,
+	findStandaloneState,
 	formatAgentTree,
 	formatIdentityUsageLine,
 	formatStatusLines,
@@ -24,13 +26,14 @@ import {
 	getMessageText,
 	identityRows,
 	readInstanceConfig,
-	readJsonFile,
 	readJsonLines,
 	readModelPool,
+	readStandaloneState,
 	registerRoleExtension,
 	resolveSpawnModel,
 	sendRpcPrompt,
 	sumTokenUsage,
+	supervisorAlive,
 	taskSummary,
 	undispatchedTargets,
 	unansweredMessages,
@@ -38,6 +41,7 @@ import {
 	type AgentRecord,
 	type AgentStatus,
 	type ModelPool,
+	type PersistedState,
 	type TeamEvent,
 	type TeamInstanceConfig,
 	type TeamRole,
@@ -51,17 +55,10 @@ const TEAM_WIDGET_KEY = "pi-team-agents";
 const RECOVERY_LIMIT = 3;
 const ROLE_NAMES: Record<TeamRole, string> = { boss: "Boss", lead: "Lead", worker: "Worker" };
 const ROLE_PROMPTS: Record<TeamRole, string> = {
-	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. Team capacity is a safety ceiling, never a target. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. team_list reports state by default; request mode "full" only when you need a role's brief text. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
-	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. Team capacity is a safety ceiling, never a target. Before adding another Worker, call team_list and explain why existing Workers cannot handle it. team_list reports state by default; request mode "full" only when you need a role's brief text.`,
+	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. ${CHILD_SOFT_LIMIT} direct Leads is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Lead only for genuinely independent work and release the rest with team_cancel. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. team_list reports state by default; request mode "full" only when you need a role's brief text. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
+	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. ${CHILD_SOFT_LIMIT} direct Workers is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Worker only for genuinely independent work and release the rest with team_cancel. Before adding another Worker, call team_list and explain why existing Workers cannot handle it. team_list reports state by default; request mode "full" only when you need a role's brief text.`,
 	worker: `You are a Worker in a Pi coding team. Execute the concrete task assigned to you using the full Pi tool environment. You receive only task-relevant messages. Explain your next actions and findings normally; your text is visible to your Department Lead and the user. Ask your Lead when blocked. You cannot create other agents.`,
 };
-
-interface PersistedState extends TeamSnapshot {
-	identityUsage?: Record<string, TokenUsage>;
-	nextAgentIndexes?: Record<TeamRole, number>;
-	supervisorSessionPath?: string;
-	version: 1;
-}
 
 interface TeamStateEntry {
 	customType?: string;
@@ -289,6 +286,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	let modelPool: ModelPool = {};
 	let nextAgentIndexes: Record<TeamRole, number> = { boss: 1, lead: 1, worker: 1 };
 	let inspectedAgentId: string | undefined;
+	let restorableTeam: { ageMs: number; directory: string; live: boolean; teamId: string } | undefined;
 	let activityPanel: TeamActivityPanel | undefined;
 	const agents = new Map<string, RuntimeAgent>();
 	const events: TeamEvent[] = [];
@@ -321,7 +319,18 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	function snapshot(): PersistedState {
-		return { version: 1, teamId, focusedBossId, nextAgentIndexes: { ...nextAgentIndexes }, supervisorSessionPath, identityUsage: { ...identityUsage }, agents: [...agents.values()].map(publicAgent) };
+		return {
+			version: 1,
+			teamId,
+			focusedBossId,
+			nextAgentIndexes: { ...nextAgentIndexes },
+			supervisorSessionPath,
+			storageId: stateDir ? basename(stateDir) : undefined,
+			supervisorUrl: serverUrl || undefined,
+			identityUsage: { ...identityUsage },
+			updatedAt: now(),
+			agents: [...agents.values()].map(publicAgent),
+		};
 	}
 
 	function reserveAgentId(agentId: string): void {
@@ -378,7 +387,9 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		pi.appendEntry<PersistedState>(TEAM_STATE_ENTRY, state);
 		mirror?.appendCustomEntry(TEAM_STATE_ENTRY, state);
 		if (statePath) writeJsonAtomic(statePath, state);
-		if (stateRoot && stateDir) writeJsonAtomic(join(stateRoot, "latest.json"), { storageId: basename(stateDir), updatedAt: now(), version: 1 });
+		// Workspace registry: the snapshot of record, read by recovery without any Pi session chain, so a team survives
+		// /new, branch switches, compaction, and --no-session runs.
+		if (stateRoot && stateDir) writeJsonAtomic(join(stateRoot, "latest.json"), state);
 	}
 
 	function appendEvent(input: Omit<TeamEvent, "eventId" | "seq" | "timestamp">): TeamEvent {
@@ -425,67 +436,17 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		context.ui.setWidget(TEAM_WIDGET_KEY, widgetLines.length ? widgetLines : ["Pi Team: /boss <task> to start"], { placement: "belowEditor" });
 	}
 
-	function readStandaloneState(directory: string): PersistedState | undefined {
-		const stored = readJsonFile<PersistedState>(join(directory, "state.json"));
-		if (stored?.version === 1 && Array.isArray(stored.agents)) return stored;
-
-		const agentsDirectory = join(directory, "agents");
-		if (!existsSync(agentsDirectory)) return undefined;
-		const storedEvents = readJsonLines<TeamEvent>(join(directory, "events.jsonl"));
-		const cancelled = new Set(storedEvents.filter((event) => event.kind === "control" && /^(Cancelled|Removed) /.test(event.content)).flatMap((event) => event.targetIds));
-		const records: AgentRecord[] = [];
-		let legacyTeamId: string | undefined;
-		for (const entry of readdirSync(agentsDirectory, { withFileTypes: true })) {
-			if (!entry.isDirectory()) continue;
-			const config = readJsonFile<TeamInstanceConfig>(join(agentsDirectory, entry.name, "instance.json"));
-			if (!config?.agentId || !config.task || !(["boss", "lead", "worker"] as const).includes(config.role)) continue;
-			if (cancelled.has(config.agentId)) continue;
-			legacyTeamId ??= config.teamId;
-			const sessionsDirectory = join(agentsDirectory, entry.name, "sessions");
-			const sessionPath = existsSync(sessionsDirectory)
-				? readdirSync(sessionsDirectory)
-					.filter((name) => name.endsWith(".jsonl"))
-					.map((name) => join(sessionsDirectory, name))
-					.sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs)[0]
-				: undefined;
-			records.push({
-				actorEpoch: config.actorEpoch,
-				agentId: config.agentId,
-				departmentId: config.departmentId,
-				name: config.agentId,
-				parentId: config.parentId,
-				role: config.role,
-				runCount: 0,
-				sessionPath,
-				identity: config.identity,
-				status: "recovering",
-				task: config.task,
-			});
-		}
-		if (!legacyTeamId || !records.length) return undefined;
-		return { version: 1, teamId: legacyTeamId, focusedBossId: records.find((agent) => agent.role === "boss")?.agentId, agents: records };
+	/** Age wording for a restorable team: a legacy snapshot rebuilt from instance.json files carries no timestamp. */
+	function lastActiveLabel(team: { ageMs: number }): string {
+		return Number.isFinite(team.ageMs) ? `${Math.round(team.ageMs / 3_600_000)}h ago` : "at an unrecorded time";
 	}
 
-	function findStandaloneState(root: string): { directory: string; state: PersistedState } | undefined {
-		const pointer = readJsonFile<{ storageId?: string }>(join(root, "latest.json"));
-		const pointedDirectory = pointer?.storageId && basename(pointer.storageId) === pointer.storageId ? join(root, pointer.storageId) : undefined;
-		const directories = readdirSync(root, { withFileTypes: true })
-			.filter((entry) => entry.isDirectory())
-			.map((entry) => join(root, entry.name))
-			.sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
-		const candidates = pointedDirectory ? [pointedDirectory, ...directories.filter((directory) => directory !== pointedDirectory)] : directories;
-		for (const directory of candidates) {
-			const state = readStandaloneState(directory);
-			if (state) return { directory, state };
-		}
-		return undefined;
-	}
-
-	function reconstruct(ctx: ExtensionContext, reason: string): void {
+	async function reconstruct(ctx: ExtensionContext, reason: string, options: { previousSessionFile?: string; restore?: boolean; storageId?: string } = {}): Promise<void> {
 		context = ctx;
 		teamSessionMirror = undefined;
 		supervisorSessionPath = undefined;
 		identityUsage = {};
+		restorableTeam = undefined;
 		for (const batch of parentNotifications.values()) if (batch.timer) clearTimeout(batch.timer);
 		parentNotifications.clear();
 		agents.clear();
@@ -507,13 +468,37 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			...readModelPool(join(stateRoot, "models.json")),
 			...readModelPool(join(stateRoot, "identities.json")),
 		};
-		stateDir = join(stateRoot, ctx.sessionManager.getSessionId());
-		if (!saved && !mainSessionPersists() && reason !== "new" && reason !== "fork") {
-			const standalone = findStandaloneState(stateRoot);
-			if (standalone) {
-				saved = standalone.state;
-				stateDir = standalone.directory;
+		const sessionStateDir = join(stateRoot, ctx.sessionManager.getSessionId());
+		// The workspace registry is the self-owned recovery source: it lives outside every Pi session file, so a team
+		// survives /new, session entry loss, branch switches, compaction, and --no-session runs. It is adopted whenever
+		// this session has no team of its own, or when /team-restore asks for it explicitly.
+		const previousSessionId = options.previousSessionFile ? basename(options.previousSessionFile, ".jsonl").split("_").at(-1) : undefined;
+		const preferredDirectory = options.storageId ? join(stateRoot, options.storageId) : previousSessionId ? join(stateRoot, previousSessionId) : undefined;
+		const registryTeam = findStandaloneState(stateRoot, preferredDirectory);
+		if (options.restore && !registryTeam) throw new Error(`No persisted Pi Team found under ${stateRoot}${options.storageId ? ` for ${options.storageId}` : ""}`);
+		let adopted = false;
+		if (options.restore) {
+			saved = registryTeam!.state;
+			stateDir = registryTeam!.directory;
+			adopted = true;
+		} else if (!saved && registryTeam) {
+			const ageMs = registryTeam.state.updatedAt ? Math.max(0, Date.now() - Date.parse(registryTeam.state.updatedAt)) : Number.POSITIVE_INFINITY;
+			// Auto-adopt only a recent team that no other live Supervisor still runs; anything else stays on disk for
+			// /team-restore, so a stale snapshot never resurrects roles or duplicates a running Team.
+			if (await supervisorAlive(registryTeam.state)) restorableTeam = { ageMs, directory: registryTeam.directory, live: true, teamId: registryTeam.state.teamId };
+			else if (ageMs > ADOPTION_WINDOW_MS) restorableTeam = { ageMs, directory: registryTeam.directory, live: false, teamId: registryTeam.state.teamId };
+			else {
+				saved = registryTeam.state;
+				stateDir = registryTeam.directory;
+				adopted = true;
 			}
+		} else stateDir = sessionStateDir;
+		if (restorableTeam) {
+			const message = restorableTeam.live
+				? `Pi Team ${restorableTeam.teamId} is still running in another Supervisor; this session stays empty. Run /team-restore to take over.`
+				: `A persisted Pi Team (${restorableTeam.teamId}) was last active ${lastActiveLabel(restorableTeam)} and was not restored automatically; run /team-restore to adopt it.`;
+			appendEvent({ actorId: "supervisor", content: message, kind: "status", targetIds: [] });
+			context?.ui.notify(message, "warning");
 		}
 		mkdirSync(stateDir, { recursive: true });
 		statePath = join(stateDir, "state.json");
@@ -540,10 +525,10 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		}
 		if (!existsSync(eventsPath) && events.length) writeFileSync(eventsPath, `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
 
-		if (saved && reason !== "new") {
-			teamId = reason === "fork" ? randomUUID() : saved.teamId;
+		if (saved && (adopted || reason !== "new")) {
+			teamId = reason === "fork" && !adopted ? randomUUID() : saved.teamId;
 			focusedBossId = saved.focusedBossId;
-			supervisorSessionPath = reason === "fork" ? undefined : saved.supervisorSessionPath;
+			supervisorSessionPath = reason === "fork" && !adopted ? undefined : saved.supervisorSessionPath;
 			identityUsage = saved.identityUsage ?? {};
 			for (const record of saved.agents) {
 				reserveAgentId(record.agentId);
@@ -576,6 +561,13 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			focusedBossId = undefined;
 		}
 		updateUi();
+	}
+
+	function resumeTeam(): void {
+		for (const agent of agents.values()) {
+			if (agent.status === "cancelled") continue;
+			void startAgent(agent, true).catch((error) => addDetail(agent, `resume failed: ${error instanceof Error ? error.message : String(error)}`));
+		}
 	}
 
 	function roleVisibleEvents(agent: Pick<RuntimeAgent, "agentId" | "role" | "departmentId">, drillDown = false): TeamEvent[] {
@@ -851,12 +843,35 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		return SessionManager.forkFrom(sessionPath, context!.cwd, nativeSessionDir).getSessionFile()!;
 	}
 
+	/**
+	 * Per-role config on disk. `sessionPath` is refreshed once the child reports its session file, so a rebuild that
+	 * has lost the registry can still reattach the role's own transcript instead of starting it over.
+	 */
+	function writeInstanceConfig(agent: RuntimeAgent): void {
+		const config: TeamInstanceConfig = {
+			actorEpoch: agent.actorEpoch,
+			agentId: agent.agentId,
+			departmentId: agent.departmentId,
+			identity: agent.identity,
+			parentId: agent.parentId,
+			role: agent.role,
+			serverUrl,
+			sessionPath: agent.sessionPath,
+			task: agent.task,
+			teamId,
+			token: agent.token,
+		};
+		agent.configPath = join(stateDir, "agents", agent.agentId, "instance.json");
+		writeFileSync(agent.configPath, JSON.stringify(config, null, 2), { encoding: "utf8", mode: 0o600 });
+	}
+
 	async function waitForReady(agent: RuntimeAgent): Promise<void> {
 		let lastError: unknown;
 		for (let attempt = 0; attempt < 60; attempt++) {
 			try {
 				const response = await agent.rpc!.request({ type: "get_state" }, 1000);
 				agent.sessionPath = response.data?.sessionFile || agent.sessionPath;
+				writeInstanceConfig(agent);
 				persistState();
 				return;
 			} catch (error) {
@@ -870,20 +885,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	async function startAgent(agent: RuntimeAgent, recovering = false): Promise<void> {
 		if (!serverUrl) throw new Error("Pi Team Supervisor is not ready");
 		mkdirSync(join(stateDir, "agents", agent.agentId), { recursive: true });
-		const config: TeamInstanceConfig = {
-			actorEpoch: agent.actorEpoch,
-			agentId: agent.agentId,
-			departmentId: agent.departmentId,
-			identity: agent.identity,
-			parentId: agent.parentId,
-			role: agent.role,
-			serverUrl,
-			task: agent.task,
-			teamId,
-			token: agent.token,
-		};
-		agent.configPath = join(stateDir, "agents", agent.agentId, "instance.json");
-		writeFileSync(agent.configPath, JSON.stringify(config, null, 2), { encoding: "utf8", mode: 0o600 });
+		writeInstanceConfig(agent);
 
 		const args = ["--mode", "rpc", "--name", `Pi Team ${agent.agentId}: ${truncate(agent.task, 50)}`, "--extension", extensionPath, `--${TEAM_INSTANCE_FLAG}`, agent.configPath];
 		if (recovering && agent.sessionPath && existsSync(agent.sessionPath)) {
@@ -960,17 +962,13 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	function childCount(parentId: string): number {
-		return [...agents.values()].filter((agent) => agent.parentId === parentId && agent.status !== "cancelled").length;
+	function childrenOf(parentId: string): RuntimeAgent[] {
+		return [...agents.values()].filter((agent) => agent.parentId === parentId && agent.status !== "cancelled");
 	}
 
 	async function createAgent(role: TeamRole, task: string, parentId?: string, name?: string, identity?: string): Promise<RuntimeAgent> {
 		await startupPromise;
 		if (role === "boss" && [...agents.values()].filter((a) => a.role === "boss" && a.status !== "cancelled").length >= MAX_BOSSES) throw new Error(`Maximum Boss count is ${MAX_BOSSES}`);
-		if (parentId && childCount(parentId) >= MAX_CHILDREN) {
-			const siblings = [...agents.values()].filter((agent) => agent.parentId === parentId && agent.status !== "cancelled");
-			throw new Error(childCapacityError(parentId, siblings));
-		}
 		const parent = parentId ? agents.get(parentId) : undefined;
 		if (role === "lead" && parent?.role !== "boss") throw new Error("Only a Boss can own a Department Lead");
 		if (role === "worker" && parent?.role !== "lead") throw new Error("Only a Department Lead can own a Worker");
@@ -1104,6 +1102,9 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}
 
 	async function handleIpc(req: IncomingMessage, res: ServerResponse): Promise<void> {
+		// Unauthenticated liveness probe, answered before actor auth: another Supervisor asks whether this team is still
+		// running before it adopts the workspace registry. It exposes nothing but the pid and team id.
+		if (req.url === "/alive") return json(res, 200, { ok: true, pid: process.pid, teamId });
 		const actor = authorized(req);
 		if (!actor) {
 			const expected = agents.get(String(req.headers["x-pi-team-actor"] || ""));
@@ -1120,6 +1121,8 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 				if (!task) throw new Error("Delegated task is required");
 				if (!reason) throw new Error("Delegation reason is required");
 				const agent = await createAgent(role, task, actor.agentId, typeof data.name === "string" ? data.name : undefined, typeof data.identity === "string" ? data.identity : undefined);
+				// Soft limit: past CHILD_SOFT_LIMIT the role is still created, but the delegator gets the headcount and states back.
+				const warning = childCapacityNote(actor.agentId, childrenOf(actor.agentId));
 				const assignment = appendEvent({
 					actorId: actor.agentId,
 					content: `Delegated ${agentPath(agent.agentId)} "${taskSummary(task)}" (${task.length} chars, ${agent.identity ?? INHERITED_IDENTITY}): ${truncate(reason, 160)}`,
@@ -1127,7 +1130,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 					kind: "assignment",
 					targetIds: [agent.agentId],
 				});
-				return json(res, 200, { agent: publicAgent(agent), eventId: assignment.eventId, seq: assignment.seq, timestamp: assignment.timestamp });
+				return json(res, 200, { agent: publicAgent(agent), eventId: assignment.eventId, seq: assignment.seq, timestamp: assignment.timestamp, warning });
 			}
 			if (req.url === "/send") {
 				const target = resolveAgent(String(data.target || ""), true);
@@ -1194,7 +1197,53 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	}});
 	pi.registerCommand("team", { description: "Show Pi Team status", handler: async (_args, ctx) => {
 		const sessionFile = context?.sessionManager.getSessionFile() ?? teamSessionMirror?.getSessionFile();
-		ctx.ui.notify(`${agents.size} agents; focused Boss: ${focusedBossId || "none"}; session: ${sessionFile || "not created"}; IPC: ${serverUrl || "starting"}`, "info");
+		const ownership = restorableTeam
+			? restorableTeam.live
+				? `\n${restorableTeam.teamId} is running in another Supervisor; /team-restore to take over`
+				: `\npersisted team ${restorableTeam.teamId} was last active ${lastActiveLabel(restorableTeam)}; /team-restore to adopt`
+			: "";
+		ctx.ui.notify(`${agents.size} agents; focused Boss: ${focusedBossId || "none"}; registry: ${stateDir ? basename(stateDir) : "none"}; session: ${sessionFile || "not created"}; IPC: ${serverUrl || "starting"}${ownership}`, "info");
+	}});
+	/**
+	 * Takeover: end the Supervisor that still holds this team, together with the roles it spawned. Only its own
+	 * `/alive` answer is trusted, so a stale snapshot can never make this kill an unrelated process.
+	 */
+	async function stopForeignOwner(storageId?: string): Promise<boolean> {
+		const state = storageId ? readStandaloneState(join(stateRoot, storageId)) : findStandaloneState(stateRoot)?.state;
+		if (!state) return false;
+		const owner = await supervisorAlive(state);
+		if (!owner?.pid) return false;
+		if (process.platform === "win32") await pi.exec("taskkill", ["/PID", String(owner.pid), "/T", "/F"], { timeout: 10_000 }).catch(() => undefined);
+		else { try { process.kill(owner.pid, "SIGTERM"); } catch {} }
+		return true;
+	}
+
+	pi.registerCommand("team-restore", { description: "Adopt the persisted Pi Team in this workspace and resume its roles; pass force to end a Supervisor that still holds it", handler: async (args, ctx) => {
+		await startupPromise;
+		const parts = args.trim().split(/\s+/).filter(Boolean);
+		const force = parts.includes("force") || parts.includes("--force");
+		const storageId = parts.find((part) => !part.startsWith("-") && part !== "force")?.replace(/^@/, "");
+		shuttingDown = true;
+		try {
+			for (const agent of agents.values()) await stopProcess(agent);
+			const target = storageId ? readStandaloneState(join(stateRoot, storageId)) : findStandaloneState(stateRoot)?.state;
+			const owner = target ? await supervisorAlive(target) : undefined;
+			if (owner && !force) {
+				shuttingDown = false;
+				const message = `Team ${target!.teamId} is still running in Supervisor pid ${owner.pid}; stop it there first, or run /team-restore force to end it and take over.`;
+				appendEvent({ actorId: "supervisor", content: message, kind: "status", targetIds: [] });
+				return ctx.ui.notify(message, "warning");
+			}
+			if (force && (await stopForeignOwner(storageId))) await new Promise((resolve) => setTimeout(resolve, 1500));
+			await reconstruct(ctx, "restore", { restore: true, storageId });
+		} catch (error) {
+			shuttingDown = false;
+			return ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+		}
+		shuttingDown = false;
+		resumeTeam();
+		updateUi();
+		ctx.ui.notify(`Adopted ${teamId}: ${agents.size} agents from ${basename(stateDir)}`, "info");
 	}});
 	pi.registerCommand("boss", { description: "Create and focus a new Boss", handler: async (args, ctx) => {
 		const parts = args.trim().split(/\s+/);
@@ -1268,11 +1317,8 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 	pi.on("session_start", async (event, ctx) => {
 		shuttingDown = false;
 		await startupPromise;
-		reconstruct(ctx, event.reason);
-		for (const agent of agents.values()) {
-			if (agent.status === "cancelled") continue;
-			void startAgent(agent, true).catch((error) => addDetail(agent, `resume failed: ${error instanceof Error ? error.message : String(error)}`));
-		}
+		await reconstruct(ctx, event.reason, { previousSessionFile: event.previousSessionFile });
+		resumeTeam();
 		updateUi();
 	});
 
@@ -1280,12 +1326,9 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		shuttingDown = true;
 		await startupPromise;
 		for (const agent of agents.values()) await stopProcess(agent);
-		reconstruct(ctx, "tree");
+		await reconstruct(ctx, "tree");
 		shuttingDown = false;
-		for (const agent of agents.values()) {
-			if (agent.status === "cancelled") continue;
-			void startAgent(agent, true).catch((error) => addDetail(agent, `tree resume failed: ${error instanceof Error ? error.message : String(error)}`));
-		}
+		resumeTeam();
 		updateUi();
 	});
 

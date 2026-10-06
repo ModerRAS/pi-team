@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **三层角色模型**：Boss（最多 3 个）→ Department Lead（每个 Boss 最多 4 个）→ Worker（每个 Lead 最多 4 个），所有角色由同一个插件入口实现。
+- **三层角色模型**：Boss（最多 3 个，硬上限）→ Department Lead（每个 Boss 建议 4 个）→ Worker（每个 Lead 建议 4 个），所有角色由同一个插件入口实现；Lead/Worker 的 4 是软限制，超出只回一条容量提醒，不阻断委派。
 - **独立且持久**：每个角色是独立的 `pi --mode rpc` 进程和 Session，随 Team 快照恢复，旧 Session 自动迁移。
 - **一个共享大群**：所有正式消息进入同一个只追加事件日志，各角色按自己的上下文投影消费。
 - **模型档位池**：委派时按「是否视觉 × 高中低」6 档选模型，只决定价格/能力，不注入额外提示词。
@@ -21,8 +21,8 @@
 ```text
 用户
   -> Boss（最多 3 个）
-     -> Department Lead（每个 Boss 最多 4 个）
-        -> Worker（每个 Lead 最多 4 个）
+     -> Department Lead（每个 Boss 建议 4 个，软限制）
+        -> Worker（每个 Lead 建议 4 个，软限制）
 ```
 
 插件内部还有一个不属于组织层级的 **Supervisor**（控制面）：负责角色身份与权限、RPC 子进程生命周期、共享事件日志的唯一写入、消息投递、配额与取消，以及主群聊与 Inspector UI。
@@ -60,13 +60,14 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 | `/to <agent-id> <message>` | 定向纠正或补充，不改变当前焦点 |
 | `/focus <boss-id>` | 把普通输入路由到指定 Boss |
 | `/cancel <agent-id>` | 停止角色及其下属，并从活动 Team、列表和底部面板中移除；独立 Session 与正式事件日志保留用于审计 |
+| `/team-restore [storageId] [force]` | 采用工作区持久化的 Team（默认注册表，可指定 storage 目录）并重启其角色，不依赖 pi 原生会话链；Team 还被另一个 Supervisor 持有时默认拒绝，加 `force` 会终止那个 Supervisor 再接管 |
 | `/agents` | 查看角色状态 |
 | `/view [limit]` | 查看最近正式群聊事件 |
 | `/inspect <agent-id>` | 让底部 Inspector 持续显示该角色的运行状态和工具生命周期；`/inspect off` 返回团队状态 |
 | `/identities` | 查看当前档位池 |
-| `/team` | 查看 Team 摘要、可恢复主 Session 路径和内部 IPC 地址 |
+| `/team` | 查看 Team 摘要、当前注册表目录、可恢复 Session 路径、内部 IPC 地址和可恢复的旧 Team |
 
-`/new`、`/resume`、`/fork` 是 pi 核心 Session 命令，插件会响应其会话缘由：`/new` 创建空 Team，`/resume` 恢复既有 Team，`/fork` 复制 Team 前缀；树分支切换会停止旧角色并恢复目标分支。
+`/new`、`/resume`、`/fork` 是 pi 核心 Session 命令，插件会响应其会话缘由：`/resume`、`/reload` 和树分支切换按「当前会话快照 → 工作区注册表」重建同一个 Team；`/new` 的新会话本身没有 Team，会接管工作区注册表中的活动 Team（同一 workspace 只维护一个活动 Team），需要一份干净 Team 时先 `/cancel` 掉现有角色；`/fork` 复制 Team 前缀并分配新 `teamId`。上面两种自动接管都受 24 小时活跃窗口和 `/alive` 探测限制；`/team-restore` 可在任何时候显式接管注册表里的 Team。
 
 `team_send` 的普通消息可发给同一 Pi Team 中任意其他 Boss、Lead 或 Worker。目标支持稳定 agent id、完整层级路径、这些形式前加 `@`，以及唯一显示名；显示名歧义、未知目标和 self-message 都会拒绝。该放宽只适用于消息，不改变委派、取消、角色列表或事件上下文的原有权限。
 
@@ -108,9 +109,14 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 
 ### 会话与恢复
 
-- Team 有一个带 `Pi Team: ...` 名称的 Supervisor 主 Session，可从 Pi 原生 `/resume` 找到。恢复该 Session 会恢复正式群聊、活动组织结构、上次仍存在的 focused Boss，并用各角色原有 Session 重启所有活动角色；`--no-session` 下创建的锚点路径会写入 Team 快照，后续恢复续写同一个锚点。
-- Boss、Lead 和 Worker 的独立 Session 使用 Pi 当前项目的默认原生 Session 目录，并以 `Pi Team <agent-id>: ...` 命名。旧版 `.pi/pi-team/.../agents/.../sessions` 下的角色 Session 会在首次恢复时迁移到原生目录。
-- Team 快照原子写入 `.pi/pi-team/<team-storage-id>/state.json`，正式群聊逐条写入同目录 `events.jsonl`；主 Session entry、独立快照和事件日志互为恢复兜底。旧版孤立 Team 由 ephemeral Supervisor 做兼容迁移。
+- **自持 Team 注册表**：`<项目>/.pi/pi-team/latest.json` 是一份完整的 Team 快照（`storageId`、`teamId`、`focusedBossId`、`nextAgentIndexes`、`identityUsage`、`updatedAt`、自己的 loopback `supervisorUrl`，以及每个角色的 `parentId` / `role` / `task` / `identity` / `sessionPath`）。它不是指针也不是 pi Session 的副本，而是插件自己的结构链权威来源，每次 Team 状态变化都原子重写。
+- **不依赖 pi 自带会话**：启动、`/resume`、`/reload`、`/new`、`/fork` 或树分支切换时，当前会话自己携带的 Team 快照优先；当前会话没有任何 Team 时，插件直接读工作区注册表重建整棵树（Boss → Lead → Worker）和 focused Boss，不需要 pi 原生 Session 里有对应的 entry。`--no-session` 运行也走同一条路径；`/fork` 仍是复制前缀语义，会分配新的 `teamId`。
+- **角色自己的会话路径**：每个角色的绝对 `sessionPath` 同时写进注册表和 `agents/<agent-id>/instance.json`，恢复时用 `--session <path>` 续写同一个角色 Session；因此角色历史与组织结构不会因为丢了 `state.json` 一起丢。
+- **自动恢复有边界**：只有最近 24 小时内活跃过、并且没有第二个 Supervisor 仍在跑这个 Team 时才会自动接管；否则只写一条提示并保持空 Team，由用户决定是否恢复。过老的快照（包括旧版本用 `instance.json` 重建出来的、没有时间戳的快照）不会被自动复活，避免启动时凭空拉起一堆无意义的角色进程。
+- **`/team-restore` 手动接管**：`/team-restore [storageId] [force]` 显式采用工作区里持久化的 Team 并重启所有角色（不传参数用注册表，传参数指定某个 storage 目录）。如果探测到另一个 Supervisor 仍在跑这个 Team，默认只提示并拒绝（`stop it there first, or run /team-restore force`）；加 `force` 才先终止那个 Supervisor 的进程树、再接管，不需要用户手动找进程。
+- **避免双开 Supervisor**：接管前会向快照里记录的 loopback 地址发一个 `/alive` 探测（只回自己的 pid 和 teamId，不做认证）。探测到另一个 Supervisor 仍在跑同一个 Team 时不接管，只写一条提示；端口或 PID 被复用无法伪造成这个应答，而 `/reload` 造成的同进程重入会被 pid 比对排除。 `/team-restore` 前的终止也只信任这个应答，不会因为快照里一个被复用的 PID 去杀死无关进程。
+- **多层兜底**：注册表 → 同目录 `state.json` → 旧版 `latest.json` 指针 → 目录扫描 → `agents/<id>/instance.json` + `events.jsonl`（丢失 `state.json` 时从每个角色的实例配置和取消事件重建层级）→ 角色自己的 Pi Session 文件。逐层降级只损失历史，不损失结构。
+- Team 的 Supervisor 主 Session 仍以 `Pi Team: ...` 命名，可从 pi 原生 `/resume` 找到；`--no-session` 下创建的锚点路径写入快照，后续恢复续写同一个锚点。
 
 ### 事件与协调
 
@@ -130,7 +136,7 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 - **投递缺口**：唤醒角色时，Supervisor 会列出该角色发出、但目标之后没有任何事件的消息（`#12 -> lead-1 at ...: delivered, no event from the target since`）。这与回执互补：回执说明「确实发出」，这里说明「对方还没有后续动作」，用于判断裁决是否真的送达。
 - **决定 ≠ 派发**：Boss/Lead 一轮结束时，如果最后的 assistant 正文提到了直属下级（稳定 agent id 或完整层级路径），而本轮既没调用 `team_send` 也没调用 `team_delegate`，Supervisor 追加一条指向该执行者的 `kind: "error"` 事件并唤醒它一次，要求真的派发或确认只是汇报。同一段正文只提醒一次，避免自唤醒循环。
 - **能力升级**：Lead/Worker 用 `team_escalate { reason, needed?, kind? }` 请求 `write`/`code` 能力，Supervisor 追加 `kind: "control"` 事件并唤醒父角色。宿主 Pi 侧的 investigate/写锁由 Pi 自己控制，本插件只负责把「被挡住」结构化上报，不悄悄放开写入。
-- **容量拒绝带状态**：达到 4 个直接下级上限时，报错逐个列出下级及其状态并标出可释放的 idle 数量（`lead-1 already has 4 active children: worker-64 (idle), worker-75 (running) — 1 idle may be released via team_cancel`）。idle 在显式 `team_cancel` 之前仍然占位，上限规则不变。
+- **容量软提醒**：直接下级超过 4 个时委派仍然成功，只在 `team_delegate` 结果里附一条带状态明细的提醒（`lead-1 now has 5 active children, past the soft limit of 4: worker-64 (idle), worker-75 (running) — 1 idle may be released via team_cancel. The role was created; ...`）。空闲角色在显式 `team_cancel` 之前仍然占位，提醒只影响模型的后续判断，不再拒绝创建。
 - **委派软提醒**：`team_delegate` 未传 `identity` 时，结果里附一句 `team_models` 提醒，不阻断委派，也不改变默认沿用主模型的行为。
 
 ### 计量与 UI
@@ -144,7 +150,7 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 
 - Supervisor IPC 只监听 loopback，并验证 `agentId + actorEpoch + instanceToken`。每个 Supervisor 只维护自己的 Team registry；跨 Team 请求无法通过实例认证。
 - 意外退出会以新的 epoch/token 从 Session 副本恢复，并要求角色先检查实际工作区状态。
-- 委派数量按任务动态决定；4 是安全上限而不是目标。新角色必须有具体的独立工作理由，并优先复用现有合适角色。
+- 委派数量按任务动态决定；4 是软限制和提醒线而不是目标。新角色必须有具体的独立工作理由，并优先复用现有合适角色；超出后仍可继续委派，但每次都会收到容量提醒。
 - 派发检查只看正文里的 agent id / 层级路径，不做中文祈使句判断：只是提到某个下级会被误报，指令里没写 id 会被漏报。误报只多一次提醒（同一段正文不重复），真实语义判断仍由模型负责。
 - 除非用户明确说「停止」「暂停」或「替换」，不得取消已有 Team 或其角色。
 
@@ -163,6 +169,7 @@ Windows 角色进程属于 `KILL_ON_JOB_CLOSE` Job Object：Node 运行时使用
 ```bash
 npm test                # runtime 单元测试（node --test）
 node smoke.mjs          # RPC 端到端 smoke（临时目录，spawn pi --mode rpc）
+node recovery-smoke.mjs # 注册表恢复 / 双开保护 / /team-restore 接管 / 过老快照不自动恢复
 node crash-smoke.mjs    # Windows 强杀 Supervisor 的 crash clean 验证
 ```
 

@@ -107,7 +107,7 @@ E5 用户继续补充
 
 ## 独立 Pi RPC Session
 
-Boss、部门主管和 Worker 都是独立的持久 Pi Session，使用当前项目的 Pi 默认 Session 目录并以 `Pi Team <agent-id>: ...` 命名，因此可由原生 `/resume` 搜索。旧版自定义目录中的角色 Session 在首次恢复时迁移到原生目录；进程崩溃和 Team 恢复直接续写同一个 Session 文件，不为每次恢复复制新文件。Supervisor 在宿主 `--no-session` 时创建的原生锚点路径随 Team 快照持久化，后续恢复打开同一个锚点。
+Boss、部门主管和 Worker 都是独立的持久 Pi Session，使用当前项目的 Pi 默认 Session 目录并以 `Pi Team <agent-id>: ...` 命名，因此可由原生 `/resume` 搜索。旧版自定义目录中的角色 Session 在首次恢复时迁移到原生目录；进程崩溃和 Team 恢复直接续写同一个 Session 文件，不为每次恢复复制新文件。每个角色 Session 的**绝对路径**随 Team 快照和 `agents/<agent-id>/instance.json` 一起持久化，所以即使快照丢失，只要实例配置还在就能接回同一个角色 Session。Supervisor 在宿主 `--no-session` 时创建的原生锚点路径随 Team 快照持久化，后续恢复打开同一个锚点。
 
 每个角色必须拥有：
 
@@ -256,13 +256,12 @@ Inspector 内容不自动写入主聊天，也不自动进入任何 Boss 的模�
 这些是实现起点，不是已经确认的产品上限：
 
 ```yaml
-maxBosses: 3
-maxLeadsPerBoss: 4
-maxWorkersPerLead: 4
-maxAgentDepth: 3
+maxBosses: 3            # 硬上限
+directChildren: 4        # Lead/Worker 的软限制：超出仍会创建，只回一条容量提醒
+maxAgentDepth: 3        # 硬上限
 ```
 
-每个父角色最多有 4 个直接子角色，这是防止失控扩张的安全上限，不是默认数量或利用率目标。一个连贯工作流通常只创建一个 Lead，一个连贯执行任务通常只创建一个 Worker；只有可独立推进且确实缩短关键路径的工作才增加并行角色。首版不为供应商限流增加复杂调度；遇到实际 429 或本机资源问题后再处理。
+Boss 数量与层级深度是硬上限；每个父角色的 4 个直接子角色是**软限制**。超出时 `team_delegate` 照常创建角色，但返回值带一条容量提醒（当前下级数量、各自状态、可释放的 idle 数），由委派方自己决定是否 `team_cancel`；这样长任务的关键路径不会被一个固定数字卡住，也不至于因为无提醒而无节制扩张。4 不是默认数量或利用率目标：一个连贯工作流通常只创建一个 Lead，一个连贯执行任务通常只创建一个 Worker；只有可独立推进且确实缩短关键路径的工作才增加并行角色。首版不为供应商限流增加复杂调度；遇到实际 429 或本机资源问题后再处理。
 
 ## 插件命令与角色工具
 
@@ -343,7 +342,7 @@ Boss、主管和 Worker 的正常 assistant 文本默认进入正式大群并显
 
 ### 7. Windows 进程生命周期
 
-Supervisor 使用 Windows Job Object 管理全部 Boss、主管、Worker 及其后代进程，确保主 Pi 退出或崩溃时统一终止。Node 运行时使用 libuv 为非 detached 子进程提供的进程级 `KILL_ON_JOB_CLOSE` Job；Bun 运行时通过 `bun:ffi` 调用 `kernel32` 创建并绑定等价 Job。真实 smoke 已验证 `pi.cmd`/Node 启动、UTF-8 LF JSONL、正常级联取消，以及只强杀 Supervisor PID 后角色进程自动消失。持久 Session 的 `/resume`、`/fork` 和 crash-recovery 语义仍需继续扩展回归覆盖。
+Supervisor 使用 Windows Job Object 管理全部 Boss、主管、Worker 及其后代进程，确保主 Pi 退出或崩溃时统一终止。Node 运行时使用 libuv 为非 detached 子进程提供的进程级 `KILL_ON_JOB_CLOSE` Job；Bun 运行时通过 `bun:ffi` 调用 `kernel32` 创建并绑定等价 Job。真实 smoke 已验证 `pi.cmd`/Node 启动、UTF-8 LF JSONL、正常级联取消，以及只强杀 Supervisor PID 后角色进程自动消失。持久 Session 的 `/resume`、`/fork` 与 crash-recovery 语义由 `recovery-smoke.mjs` 继续覆盖：注册表接管、双开保护和 `/team-restore` 都有真实进程回归。
 
 ### 8. 角色通过实例配置和 prompt 注入确定
 
@@ -353,9 +352,15 @@ Supervisor 使用 Windows Job Object 管理全部 Boss、主管、Worker 及其�
 
 Team 插件自行完成 loopback IPC 的随机实例凭据、actor/epoch 校验、消息大小限制和 fail-closed 行为。每个 Supervisor 只持有一个 Team 的 agent registry；普通消息目标必须在该 registry 中唯一解析，跨 Team actor 也无法通过本 server 的 token/epoch 认证。消息权限不会改变委派、取消、状态控制或角色上下文投影。这是实现职责，不是用户侧未决需求。
 
-### 10. 遵循 Pi 原生会话导航语义
+### 10. 遵循 Pi 原生会话导航语义，但结构链由插件自持
 
-团队状态随主 Pi 会话一起遵循原生行为：Team 使用带 `Pi Team: ...` 名称的 Supervisor 主 Session，因此可由 `/resume` 发现；恢复后重建正式群聊、组织结构、上次 focused Boss 和各角色 Session。若宿主使用 `--no-session`，插件创建只承载 Team 快照与正式事件的原生 Session 锚点，避免 Team 成为不可恢复的内存状态。`/reload` 重新加载 Supervisor 和所有角色的 Team 插件逻辑；`/resume` 恢复 Team；`/fork` 复制 Team 前缀；`/new` 创建空 Team。独立 `state.json` 与 `events.jsonl` 在主 Session 缺失或旧版崩溃遗留时提供恢复兜底。
+团队状态仍尊重原生会话行为：Team 使用带 `Pi Team: ...` 名称的 Supervisor 主 Session，可由 `/resume` 发现；`/reload` 重新加载 Supervisor 和所有角色的插件逻辑；`/resume` 恢复 Team；`/fork` 复制 Team 前缀并分配新 `teamId`。宿主使用 `--no-session` 时，插件创建只承载 Team 快照与正式事件的原生 Session 锚点。
+
+但恢复不再以 pi Session entry 为唯一真相：插件的自持注册表 `<项目>/.pi/pi-team/latest.json` 保存在每次状态变化时原子重写的完整快照（teamId、focused Boss、角色 id 索引、每个角色的 parentId/role/task/identity/sessionPath、PID、token 用量）。重建顺序是「当前会话快照 → 工作区注册表 → 旧版 latest.json 指针 → 目录扫描 → `agents/<id>/instance.json` + 取消事件 → 角色原生 Session」。因此 `/new` 或分支切换丢掉 entry、compaction 重写历史、甚至仅凭磁盘残留，都能重建同一棵树；`/team-restore` 提供显式接管。
+
+自动接管有两个限制，因为“磁盘上有快照”不等于“这是用户现在想要的 Team”：只有 24 小时内活跃过、且第二个 Supervisor 向快照里记录的 loopback 地址发 `/alive` 探测得不到应答时才会自动接管。用 IPC 探测而不是 PID 存活判断，是因为 PID 会被系统复用（回收后的 PID 会让一个两个月前的快照看起来“仍然活着”），而 `/alive` 还要返回 teamId 和以 pid 区分同进程内的 `/reload` 重入。不满足条件时只写一条提示事件并保持空 Team，快照原样留在磁盘上等 `/team-restore`。
+
+`/team-restore` 是显式接管入口：默认只在无人持有时采用（包括从过老快照恢复）；探测到另一个 Supervisor 仍在跑同一个 Team 时拒绝并提示，加 `force` 才按 `/alive` 返回的 pid 终止那个 Supervisor 的进程树再接管。终止目标只来自 `/alive` 应答，不来自快照里可能已被复用的 PID，因此不会误杀无关进程。
 
 ### 11. Inspector 使用非抢焦点 overlay
 
@@ -399,6 +404,7 @@ Inspector 作为 `nonCapturing` overlay，不手工把焦点设为 `null`。真�
 5. 一个 Boss、一个主管、四个并发 Worker 的完整共享工作区闭环。
 6. 多 Boss 在线性上下文不同前缀上的创建、定向纠正和用户控制的停止。
 7. 原生 `/reload`、`/resume`、`/fork`、`/new` 团队生命周期，以及角色 RPC 异常退出后的自动重启和任务恢复验证。
+8. 自持 Team 注册表（`.pi/pi-team/latest.json` + `agents/<id>/instance.json`）的结构链重建与 `/team-restore` 手动接管验证。
 
 ## 第一阶段验收
 
@@ -407,7 +413,7 @@ Inspector 作为 `nonCapturing` overlay，不手工把焦点设为 `null`。真�
 - 用户能看全部正式群聊，并能在 Inspector 查看任意角色的实现细节而不失去主聊天输入焦点。
 - Boss 默认只收到主管汇报，但可主动下钻；主管每次被唤醒时自动收到事件游标之后的完整部门快照。
 - Worker 默认只收到定向消息和必要任务内容；Worker settled、crash 和恢复结果必定通知主管，长时间运行时每 10 分钟重复巡检。
-- Boss 与主管的实质执行分别委派给最少必要的 Lead 与 Worker；容量上限不会被当作目标填满。
+- Boss 与主管的实质执行分别委派给最少必要的 Lead 与 Worker；4 个直接下级是软限制而不是目标，超出只产生容量提醒。
 - `/to` 能定向纠正原角色；新 Boss 不会自动抢走或停止旧任务。
 - 用户明确停止后，目标角色及其下属收到 RPC abort；已经产生的外部副作用不承诺回滚。
 - 每个角色有独立 Pi Session，且继承用户正常安装的插件能力。

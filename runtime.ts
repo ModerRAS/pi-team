@@ -1,5 +1,6 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import type { AgentRecord, TeamEvent, TeamInstanceConfig, TeamRole, TeamSnapshot } from "./shared.ts";
 
 export interface RpcPromptRequester {
 	request(command: { message: string; streamingBehavior: "steer"; type: "prompt" }): Promise<unknown>;
@@ -238,6 +239,112 @@ export function writeJsonAtomic(path: string, value: unknown): void {
 	const temporaryPath = `${path}.${process.pid}.tmp`;
 	writeFileSync(temporaryPath, JSON.stringify(value, null, 2), "utf8");
 	renameSync(temporaryPath, path);
+}
+
+export interface PersistedState extends TeamSnapshot {
+	identityUsage?: Record<string, TokenUsage>;
+	nextAgentIndexes?: Record<TeamRole, number>;
+	/** Directory name of the storage this snapshot belongs to; also the workspace registry key. */
+	storageId?: string;
+	supervisorSessionPath?: string;
+	/** Loopback IPC address of the Supervisor that wrote this snapshot, used only for the liveness probe. */
+	supervisorUrl?: string;
+	updatedAt?: string;
+	version: 1;
+}
+
+/**
+ * One team directory. Prefers the atomic snapshot; without it, rebuilds the structure chain from the per-role
+ * `instance.json` files and the cancellation events, so losing `state.json` costs history but not the hierarchy.
+ */
+export function readStandaloneState(directory: string): PersistedState | undefined {
+	const stored = readJsonFile<PersistedState>(join(directory, "state.json"));
+	if (stored?.version === 1 && Array.isArray(stored.agents)) return stored;
+
+	const agentsDirectory = join(directory, "agents");
+	if (!existsSync(agentsDirectory)) return undefined;
+	const storedEvents = readJsonLines<TeamEvent>(join(directory, "events.jsonl"));
+	const cancelled = new Set(storedEvents.filter((event) => event.kind === "control" && /^(Cancelled|Removed) /.test(event.content)).flatMap((event) => event.targetIds));
+	const records: AgentRecord[] = [];
+	let legacyTeamId: string | undefined;
+	for (const entry of readdirSync(agentsDirectory, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+		const config = readJsonFile<TeamInstanceConfig>(join(agentsDirectory, entry.name, "instance.json"));
+		if (!config?.agentId || !config.task || !(["boss", "lead", "worker"] as const).includes(config.role)) continue;
+		if (cancelled.has(config.agentId)) continue;
+		legacyTeamId ??= config.teamId;
+		const legacySessionDirectory = join(agentsDirectory, entry.name, "sessions");
+		const legacySessionPath = existsSync(legacySessionDirectory)
+			? readdirSync(legacySessionDirectory)
+				.filter((name) => name.endsWith(".jsonl"))
+				.map((name) => join(legacySessionDirectory, name))
+				.sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs)[0]
+			: undefined;
+		const sessionPath = config.sessionPath && existsSync(config.sessionPath) ? config.sessionPath : legacySessionPath;
+		records.push({
+			actorEpoch: config.actorEpoch,
+			agentId: config.agentId,
+			departmentId: config.departmentId,
+			name: config.agentId,
+			parentId: config.parentId,
+			role: config.role,
+			runCount: 0,
+			sessionPath,
+			identity: config.identity,
+			status: "recovering",
+			task: config.task,
+		});
+	}
+	if (!legacyTeamId || !records.length) return undefined;
+	return { version: 1, teamId: legacyTeamId, focusedBossId: records.find((agent) => agent.role === "boss")?.agentId, agents: records };
+}
+
+/** The workspace registry written outside every state directory: full snapshot plus the storage directory it belongs to. */
+export function readRegistryState(root: string): { directory: string; state: PersistedState } | undefined {
+	const registry = readJsonFile<PersistedState>(join(root, "latest.json"));
+	if (registry?.version !== 1 || !Array.isArray(registry.agents) || !registry.storageId) return undefined;
+	if (!/^[A-Za-z0-9_-]+$/.test(registry.storageId)) return undefined;
+	return { directory: join(root, registry.storageId), state: registry };
+}
+
+/**
+ * Self-owned recovery source. Order: an explicit/preferred directory, the workspace registry, a legacy pointer, then
+ * every state directory newest-first. Deliberately independent of any Pi session file.
+ */
+export function findStandaloneState(root: string, preferredDirectory?: string): { directory: string; state: PersistedState } | undefined {
+	const registry = readRegistryState(root);
+	const pointer = registry ? undefined : readJsonFile<{ storageId?: string }>(join(root, "latest.json"));
+	const pointedDirectory = pointer?.storageId && /^[A-Za-z0-9_-]+$/.test(pointer.storageId) ? join(root, pointer.storageId) : undefined;
+	const directories = readdirSync(root, { withFileTypes: true })
+		.filter((entry) => entry.isDirectory())
+		.map((entry) => join(root, entry.name))
+		.sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs);
+	const candidates = [...new Set([preferredDirectory, registry?.directory, pointedDirectory, ...directories].filter((directory): directory is string => Boolean(directory)))];
+	for (const directory of candidates) {
+		const state = directory === registry?.directory ? registry.state : readStandaloneState(directory);
+		if (state) return { directory, state };
+	}
+	return undefined;
+}
+
+/** How old a persisted team may be and still be adopted automatically; older teams need `/team-restore`. */
+export const ADOPTION_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The live Supervisor still running this team, when one answers. The probe goes to the loopback address recorded in
+ * the snapshot, so a recycled port or PID cannot fake it, and a Supervisor never counts its own process as foreign
+ * (a `/reload` re-entry in the same process answers with its own pid).
+ */
+export async function supervisorAlive(state: Pick<PersistedState, "supervisorUrl" | "teamId">): Promise<{ pid?: number } | undefined> {
+	if (!state.supervisorUrl || !state.teamId) return undefined;
+	try {
+		const response = await fetch(`${state.supervisorUrl}/alive`, { method: "POST", signal: AbortSignal.timeout(700) });
+		if (!response.ok) return undefined;
+		const payload = (await response.json()) as { pid?: number; teamId?: string };
+		return payload.teamId === state.teamId && payload.pid !== process.pid ? payload : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 export async function sendRpcPrompt(rpc: RpcPromptRequester, message: string): Promise<void> {
