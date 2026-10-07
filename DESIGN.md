@@ -208,7 +208,9 @@ type TeamEvent = {
 };
 ```
 
-`seq` 只表示 Supervisor 的提交顺序，不等于真实因果顺序、消息处理顺序或结果有效性。结果是否有效由 `taskId + generation + causationId + disposition` 判断。`team_send` 把本次派发的 `seq/eventId` 作为回执返回给调用方，供后续引用；回执是写入侧的，不等于已读或已处理。
+`seq` 只表示 Supervisor 的提交顺序，不等于真实因果顺序、消息处理顺序或结果有效性。结果是否有效由 `taskId + generation + causationId + disposition` 判断。`team_send` 与 `team_delegate` 把本次派发的 `seq/eventId` 作为回执返回给调用方，供后续引用；回执是写入侧的，不等于已读或已处理。
+
+事件与工具结果只携带身份、状态和出处，不携带 brief 正文：`started` / `assignment` 事件写 `"任务首行摘要" (brief N chars, instance.json 路径)`，完整正文留在委派方的工具调用记录、`instance.json`/`state.json` 和子角色 Session 里。子角色的 system prompt 是它自己那份权威副本，唤醒提示不再重复一遍，避免每个角色每轮为同一段文字付两次上下文。
 
 正式事件至少包括：
 
@@ -236,7 +238,7 @@ UI 把所有正常聊天和执行细节分流：
 
 ### 主 transcript
 
-所有角色的 `message_end` 文本作为正式事件按全局序号显示。`/view [limit]` 可查看最近正式事件，`/to <agent-id> <message>` 和完整层级路径都可用于定向消息；这些操作不改变角色权限或上下文投影。
+所有角色的 `message_end` 文本作为正式事件按全局序号显示。`/view [limit]` 可查看最近正式事件，`/to <agent-id> <message>` 和完整层级路径都可用于定向消息；这些操作不改变角色权限或上下文投影。`team_list` 默认返回状态行（角色、状态、档位、最后活动时间、任务首行摘要，以及“运行中但 10 分钟无事件”的 ATTENTION 页脚），完整 brief 需要显式 `mode: "full"`，所以周期性轮询不再重复注入每个角色的 briefing。
 
 ### Agent Inspector
 

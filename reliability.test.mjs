@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, writeJsonAtomic } from "./runtime.ts";
+import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, taskSummary, writeJsonAtomic } from "./runtime.ts";
 import { childCapacityError, undispatchedTargets, unansweredMessages } from "./shared.ts";
 
 test("capacity rejection names child states and releasable idle slots", () => {
@@ -222,6 +222,34 @@ test("team_models output lists inherited alone when no pool is configured", () =
 	assert.equal(aliasLines.length, 8);
 	assert.equal(aliasLines[6], "inherited (main session model; pass identity \"inherited\")");
 	assert.equal(aliasLines[7], "All 6 tiers map to vendor/one. If one model is intended, drop the pool file and pass identity \"inherited\" instead.");
+});
+
+test("taskSummary keeps one identifying line instead of the brief body", () => {
+	assert.equal(taskSummary("Pure read-only audit.\n\nSecond paragraph with details."), "Pure read-only audit.");
+	assert.equal(taskSummary("\n\n  Spaced   out\nmore"), "Spaced out");
+	assert.equal(taskSummary(""), "");
+	const long = taskSummary("x".repeat(120));
+	assert.equal(long.length, 80);
+	assert.ok(long.endsWith("…"));
+});
+
+test("status lines report state, activity and stuck roles without brief text", () => {
+	const rows = [
+		{ agentId: "boss-1", path: "boss-1", role: "boss", status: "idle", runCount: 2, taskSummary: "orchestrate" },
+		{ agentId: "lead-1", path: "boss-1/lead-1", identity: "text-high", role: "lead", status: "running", runCount: 1, taskSummary: "batch 2", lastEventAgeMs: 20_000 },
+		{ agentId: "worker-90", path: "boss-1/lead-1/worker-90", identity: "vision-medium", role: "worker", status: "idle", runCount: 1, taskSummary: "render probe", lastEventAgeMs: 6 * 60_000, noReport: true, artifacts: ["out/evidence.md"] },
+		{ agentId: "worker-95", path: "boss-1/lead-1/worker-95", role: "worker", status: "running", runCount: 1, taskSummary: "sweep", lastEventAgeMs: 14 * 60_000 },
+	];
+
+	assert.deepEqual(formatStatusLines(rows), [
+		"boss-1 [boss/idle r2] inherited \"orchestrate\"",
+		"boss-1/lead-1 [lead/running r1] text-high \"batch 2\" last event 20s ago",
+		"boss-1/lead-1/worker-90 [worker/idle r1] vision-medium \"render probe\" last event 6m ago no report since settle requires out/evidence.md",
+		"boss-1/lead-1/worker-95 [worker/running r1] inherited \"sweep\" last event 14m ago",
+		"ATTENTION: boss-1/lead-1/worker-95 running with no event for 14m",
+	]);
+	assert.deepEqual(formatStatusLines([]), []);
+	assert.deepEqual(formatStatusLines([rows[1]]), ["boss-1/lead-1 [lead/running r1] text-high \"batch 2\" last event 20s ago"]);
 });
 
 test("spawn model falls back to main conversation model when no identity", () => {

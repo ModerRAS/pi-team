@@ -13,6 +13,7 @@
 - **持续监督**：Worker 每 10 分钟触发 Lead 巡检，直到 settled；事件游标让 Lead 无需轮询即可拿到增量消息。
 - **token 计量与对账**：每个角色的 token 用量随每次 LLM 调用实时统计，settled 时与 Session 文件对账，随 Team 状态持久化。
 - **上下文友好**：system prompt、工具集和历史 Session 追加式保持稳定，定向消息正文只在正式事件中保留一份。
+- **状态查询不重复 brief**：`team_list` 默认只返回状态（id、角色、状态、档位、最后活动时间、任务首行摘要），需要完整 brief 时才用 `mode: "full"`；一次状态轮询的开销不再随 brief 长度增长。
 - **交付面可观测**：派发返回事件序号，唤醒时列出「已发出但对方还没有后续动作」的消息；点名了下级却没调用派发工具会被记录；`team_require_artifact` 声明必须落盘的产物，settle 时缺失按硬失败上报；`team_escalate` 让 Lead/Worker 结构化请求缺失的能力。
 
 ## 架构
@@ -49,7 +50,7 @@ pi install git:github.com/ModerRAS/pi-team
 /team                          <- Team 摘要、可恢复 Session 路径和内部 IPC 地址
 ```
 
-Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，在 Team 工具上只保留 `team_send`、`team_models`、`team_read`、`team_list`、`team_escalate` 和 `team_require_artifact`，不能继续委派或移除其他角色。Lead 和 Worker 都能用 `team_escalate` 报告被挡住的能力，用 `team_require_artifact` 声明本轮必须产出的文件。
+Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker；两者还可使用 `team_send`、`team_read`、`team_list` 和 `team_cancel`。`team_list` 默认返回状态行（`mode: "status"`），只有显式传 `mode: "full"` 才包含每个角色的完整 brief。`team_cancel` 只能移除直属下属，并级联移除其后代。Worker 完整继承 Pi 的实现工具，在 Team 工具上只保留 `team_send`、`team_models`、`team_read`、`team_list`、`team_escalate` 和 `team_require_artifact`，不能继续委派或移除其他角色。Lead 和 Worker 都能用 `team_escalate` 报告被挡住的能力，用 `team_require_artifact` 声明本轮必须产出的文件。
 
 ## 命令一览
 
@@ -123,8 +124,9 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 
 ### 交付、派发与能力升级
 
+- **事件不携带 brief 正文**：`started` 事件、`assignment` 事件和 `team_delegate` 的返回值只带身份、状态和出处（`"任务首行摘要" (brief N chars, <instance.json 路径>)`）。完整正文只存在于三处：委派方自己的工具调用历史、`state.json` / `agents/<id>/instance.json`、以及子角色 Session；子角色的 system prompt 是它的唯一权威副本，首次/恢复唤醒提示不再重复一遍。需要引用某次派发时用回执里的 `#seq`。
 - **产物义务**：Lead/Worker 用 `team_require_artifact { path, note? }` 声明本轮必须存在的产物。`agent_settled` 时 Supervisor 按该角色工作目录解析路径并检查；缺失时不报干净的 idle，而是写入 `kind: "error"` 事件、通知 Lead，并把该角色唤醒一次要求补齐或说明原因；再次 settle 仍缺失则标记 `failed`。全部存在后义务清空，随取消一起失效；义务列表随 Team 状态持久化。
-- **派发回执**：`team_send` 返回 `{ delivered, eventId, seq, timestamp }`，正文带上 `#seq`。派发因此可以被引用，「我发出去了」从回忆变成可核对的事实；`delivered` 仍然只表示已写入并尝试唤醒。
+- **派发回执**：`team_send` 与 `team_delegate` 都返回 `{ delivered, eventId, seq, timestamp }`，正文带上 `#seq`。派发因此可以被引用，「我发出去了」从回忆变成可核对的事实；`delivered` 仍然只表示已写入并尝试唤醒。
 - **投递缺口**：唤醒角色时，Supervisor 会列出该角色发出、但目标之后没有任何事件的消息（`#12 -> lead-1 at ...: delivered, no event from the target since`）。这与回执互补：回执说明「确实发出」，这里说明「对方还没有后续动作」，用于判断裁决是否真的送达。
 - **决定 ≠ 派发**：Boss/Lead 一轮结束时，如果最后的 assistant 正文提到了直属下级（稳定 agent id 或完整层级路径），而本轮既没调用 `team_send` 也没调用 `team_delegate`，Supervisor 追加一条指向该执行者的 `kind: "error"` 事件并唤醒它一次，要求真的派发或确认只是汇报。同一段正文只提醒一次，避免自唤醒循环。
 - **能力升级**：Lead/Worker 用 `team_escalate { reason, needed?, kind? }` 请求 `write`/`code` 能力，Supervisor 追加 `kind: "control"` 事件并唤醒父角色。宿主 Pi 侧的 investigate/写锁由 Pi 自己控制，本插件只负责把「被挡住」结构化上报，不悄悄放开写入。

@@ -83,6 +83,47 @@ export function identityRows(pool: ModelPool, mainModel?: { provider: string; id
 	return rows;
 }
 
+export const INSPECTION_INTERVAL_MS = 10 * 60_000;
+
+/** One line identifying a delegated brief without carrying its body. */
+export function taskSummary(task: string, max = 80): string {
+	const firstLine = task.split(/\r?\n/).find((line) => line.trim()) ?? "";
+	const normalized = firstLine.replace(/\s+/g, " ").trim();
+	return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
+}
+
+/** State of one role for `team_list` status mode: identity, activity, and the brief's first line instead of the brief. */
+export interface TeamStatusRow {
+	agentId: string;
+	artifacts?: string[];
+	departmentId?: string;
+	identity?: string;
+	lastEventAgeMs?: number;
+	model?: string;
+	noReport?: boolean;
+	parentId?: string;
+	path: string;
+	role: "boss" | "lead" | "worker";
+	runCount: number;
+	status: string;
+	taskSummary: string;
+}
+
+/** Compact status form: enough to answer "who is running, what finished, what is stuck" without re-reading briefs. */
+export function formatStatusLines(rows: TeamStatusRow[]): string[] {
+	const age = (ms: number): string => ms >= 3_600_000 ? `${Math.floor(ms / 3_600_000)}h` : ms >= 60_000 ? `${Math.floor(ms / 60_000)}m` : `${Math.floor(ms / 1000)}s`;
+	const lines = rows.map((row) => {
+		const parts = [`${row.path} [${row.role}/${row.status} r${row.runCount}]`, row.identity ?? "inherited", `"${row.taskSummary}"`];
+		if (row.lastEventAgeMs !== undefined) parts.push(`last event ${age(row.lastEventAgeMs)} ago`);
+		if (row.noReport) parts.push("no report since settle");
+		if (row.artifacts?.length) parts.push(`requires ${row.artifacts.join(", ")}`);
+		return parts.join(" ");
+	});
+	const stuck = rows.filter((row) => row.status === "running" && (row.lastEventAgeMs ?? 0) > INSPECTION_INTERVAL_MS);
+	if (stuck.length) lines.push(`ATTENTION: ${stuck.map((row) => `${row.path} running with no event for ${age(row.lastEventAgeMs ?? 0)}`).join("; ")}`);
+	return lines;
+}
+
 /** Note when every configured tier aliases one model, so identical rows are not read as separate choices. */
 export function degeneratePoolNote(pool: ModelPool): string | undefined {
 	const patterns = Object.values(pool);
