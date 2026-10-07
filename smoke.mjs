@@ -153,8 +153,9 @@ try {
 	const inherited = (identities.identities ?? []).find((row) => row.identity === "inherited");
 	if (!inherited?.pattern) throw new Error("/identities did not expose the built-in inherited identity with a resolved main model");
 	if (!inherited.inherited) throw new Error("The inherited identity row was not marked as the built-in one");
-	const leadResult = await postAs(bossConfig, "/delegate", { task: "Capacity smoke lead; wait for direction.", reason: "Exercise the explicit maximum-capacity control path.", name: "Capacity Lead" });
+	const leadResult = await postAs(bossConfig, "/delegate", { task: "Capacity smoke lead; wait for direction.", reason: "Exercise the explicit maximum-capacity control path.", name: "capacity-lead" });
 	const lead = leadResult.agent;
+	if (lead.name !== "capacity-lead") throw new Error(`Delegated role did not keep its name: ${lead.name}`);
 	if (!leadResult.seq || !leadResult.eventId || !leadResult.timestamp) throw new Error("team_delegate did not return a dispatch receipt");
 	const leadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${lead.agentId}/instance.json`), "utf8"));
 	const workers = await Promise.all(Array.from({ length: 4 }, (_, index) => postAs(leadConfig, "/delegate", { task: `Capacity smoke worker ${index + 1}; wait for direction.`, reason: `Verify concurrent Worker slot ${index + 1} remains available for complex tasks.`, ...(index === 0 ? { identity: "inherited" } : {}) })));
@@ -163,9 +164,10 @@ try {
 	if (!workers[0].agent.model || workers[0].agent.model !== lead.model) throw new Error(`inherited identity spawned ${workers[0].agent.model} instead of the main model ${lead.model}`);
 	const workerConfigs = workers.map((result) => JSON.parse(readFileSync(resolve(teamAgentDir, `${result.agent.agentId}/instance.json`), "utf8")));
 	const crossLeadTask = "Cross-branch messaging smoke lead; wait for direction.\n\nMARKER_DO_NOT_ECHO_9f2c: this brief body must never be copied into a team event.";
-	const crossLead = (await postAs(bossConfig, "/delegate", { task: crossLeadTask, reason: "Create a second department to verify same-Team cross-branch messaging.", name: "Capacity Lead" })).agent;
+	const crossLead = (await postAs(bossConfig, "/delegate", { task: crossLeadTask, reason: "Create a second department to verify same-Team cross-branch messaging.", name: "capacity-lead" })).agent;
+	if (crossLead.name !== "capacity-lead-2") throw new Error(`Duplicate role names were not made unique: ${crossLead.name}`);
 	const crossLeadConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${crossLead.agentId}/instance.json`), "utf8"));
-	const crossWorker = (await postAs(crossLeadConfig, "/delegate", { task: "Cross-branch messaging smoke worker; wait for direction.", reason: "Provide a Worker under a different Lead for messaging verification.", name: "Cross Branch Worker" })).agent;
+	const crossWorker = (await postAs(crossLeadConfig, "/delegate", { task: "Cross-branch messaging smoke worker; wait for direction.", reason: "Provide a Worker under a different Lead for messaging verification.", name: "cross-branch-worker" })).agent;
 	const crossWorkerConfig = JSON.parse(readFileSync(resolve(teamAgentDir, `${crossWorker.agentId}/instance.json`), "utf8"));
 
 	const messages = {
@@ -178,13 +180,13 @@ try {
 	};
 	const parentChildSend = await postAs(leadConfig, "/send", { target: `@${workers[0].agent.agentId}`, message: messages.parentChild });
 	await postAs(workerConfigs[0], "/send", { target: `@${workers[1].agent.path}`, message: messages.siblingWorker });
-	await postAs(workerConfigs[0], "/send", { target: "@Cross Branch Worker", message: messages.crossWorker });
+	await postAs(workerConfigs[0], "/send", { target: "@cross-branch-worker", message: messages.crossWorker });
 	await postAs(leadConfig, "/send", { target: crossLead.path, message: messages.siblingLead });
 	await postAs(leadConfig, "/send", { target: crossWorker.agentId, message: messages.nonDirectLeadWorker });
 	await postAs(crossWorkerConfig, "/send", { target: lead.agentId, message: messages.reverseLeadWorker });
 	await expectRejected(() => postAs(workerConfigs[0], "/send", { target: workers[0].agent.agentId, message: "self must fail" }), "may only message another role in the same Pi Team");
 	await expectRejected(() => postAs(workerConfigs[0], "/send", { target: "@missing-worker", message: "unknown must fail" }), "Unknown target");
-	await expectRejected(() => postAs(workerConfigs[0], "/send", { target: "@Capacity Lead", message: "ambiguous must fail" }), "Ambiguous target name");
+	await expectRejected(() => postAs(leadConfig, "/delegate", { task: "must fail", reason: "Verify an illegal role name is rejected with retry guidance.", name: "Capacity Lead" }), "it contains whitespace. Pass a short workstream label as name");
 	await expectRejected(() => postAs({ ...workerConfigs[0], actorEpoch: "foreign-team-epoch", token: "foreign-team-token" }, "/send", { target: crossWorker.agentId, message: "cross-team must fail" }, 0), "Unauthorized");
 	await expectRejected(() => postAs(workerConfigs[0], "/delegate", { task: "must fail", reason: "Workers still cannot delegate team roles." }), "Workers cannot delegate");
 	await expectRejected(() => postAs(leadConfig, "/cancel", { target: crossWorker.agentId }), "may only cancel direct subordinates");

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, writeJsonAtomic } from "./runtime.ts";
+import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, ROLE_NAME_GUIDE, ROLE_NAME_MAX, degeneratePoolNote, fallbackRoleName, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, roleNameError, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, uniqueRoleName, writeJsonAtomic } from "./runtime.ts";
 import { childCapacityNote, undispatchedTargets, unansweredMessages } from "./shared.ts";
 
 test("capacity note stays silent at the soft limit and names states past it", () => {
@@ -126,6 +126,50 @@ test("team tree shows hierarchy, Worker counts, and model selections", () => {
 		"  └─ lead-2 [vision-high: opencode-go/gpt-5.6-luna] [idle r0] (0 workers)",
 	]);
 	assert.equal(formatAgentTree(agents.filter((agent) => agent.agentId !== "worker-1"), "boss-1")[1], "  ├─ lead-1 [text-high: opencode-go/deepseek-v4-pro] [running r1] (1 worker)");
+});
+
+test("role names are single addressable tokens with retry guidance", () => {
+	assert.equal(roleNameError("nav-tree"), undefined);
+	assert.equal(roleNameError("导航树完整性"), undefined);
+	assert.equal(roleNameError("verify_a2"), undefined);
+	assert.equal(roleNameError("x".repeat(ROLE_NAME_MAX)), undefined);
+	assert.equal(roleNameError("nav tree"), "it contains whitespace");
+	assert.equal(roleNameError("nav/tree"), 'it contains characters other than letters, digits, "-" and "_"');
+	assert.equal(roleNameError("nav#1"), 'it contains characters other than letters, digits, "-" and "_"');
+	assert.equal(roleNameError("lead-7"), "it looks like an agent id");
+	assert.equal(roleNameError("off"), "it is a reserved word");
+	assert.equal(roleNameError("  "), "it is empty");
+	assert.equal(roleNameError("x".repeat(ROLE_NAME_MAX + 1)), `it is longer than ${ROLE_NAME_MAX} characters`);
+	assert.match(ROLE_NAME_GUIDE, /no spaces/);
+	assert.match(ROLE_NAME_GUIDE, /unique within the Team/);
+});
+
+test("unnamed roles fall back to the brief and stay unique", () => {
+	assert.equal(fallbackRoleName("Rebuild legacy-template fixture service", "Lead 1"), "Rebuild-legacy-template");
+	assert.equal(fallbackRoleName("导航树完整性：补全跳转", "Lead 2"), "导航树完整性-补全跳转");
+	assert.equal(fallbackRoleName("!!! ???", "Lead 1"), "Lead-1-role");
+	assert.equal(roleNameError(fallbackRoleName("!!! ???", "Worker 9")), undefined);
+	assert.equal(roleNameError(fallbackRoleName("lead-3", "Lead 4")), undefined);
+	assert.equal(uniqueRoleName("nav-tree", ["nav-tree"]), "nav-tree-2");
+	assert.equal(uniqueRoleName("nav-tree", ["nav-tree", "nav-tree-2"]), "nav-tree-3");
+	const longest = uniqueRoleName("x".repeat(ROLE_NAME_MAX), ["x".repeat(ROLE_NAME_MAX)]);
+	assert.equal(longest.length, ROLE_NAME_MAX);
+	assert.equal(roleNameError(longest), undefined);
+});
+
+test("the team panel and status lines label roles with their names", () => {
+	const agents = [
+		{ agentId: "boss-1", name: "Boss 1", role: "boss", status: "idle", runCount: 0 },
+		{ agentId: "lead-11", name: "类型覆盖普查", parentId: "boss-1", role: "lead", status: "running", runCount: 90 },
+		{ agentId: "worker-181", name: "default-hero-evidence", parentId: "lead-11", role: "worker", status: "idle", runCount: 4 },
+	];
+
+	assert.deepEqual(formatAgentTree(agents, "boss-1"), [
+		"> Boss 1 (boss-1) [inherited: default] [idle r0]",
+		"  └─ 类型覆盖普查 (lead-11) [inherited: default] [running r90] (1 worker)",
+		"     └─ default-hero-evidence (worker-181) [inherited: default] [idle r4]",
+	]);
+	assert.equal(formatStatusLines([{ agentId: "lead-11", name: "类型覆盖普查", path: "boss-1/lead-11", role: "lead", status: "running", runCount: 90, taskSummary: "普查全站类型" }])[0], "类型覆盖普查 (boss-1/lead-11) [lead/running r90] inherited \"普查全站类型\"");
 });
 
 test("durable team state and events survive restart reads", async () => {
