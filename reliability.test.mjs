@@ -1,29 +1,24 @@
+import { createServer } from "node:http";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, taskSummary, writeJsonAtomic } from "./runtime.ts";
-import { childCapacityError, undispatchedTargets, unansweredMessages } from "./shared.ts";
+import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, degeneratePoolNote, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, writeJsonAtomic } from "./runtime.ts";
+import { childCapacityNote, undispatchedTargets, unansweredMessages } from "./shared.ts";
 
-test("capacity rejection names child states and releasable idle slots", () => {
+test("capacity note stays silent at the soft limit and names states past it", () => {
+	const four = [
+		{ agentId: "worker-1", status: "running" },
+		{ agentId: "worker-2", status: "idle" },
+		{ agentId: "worker-3", status: "recovering" },
+		{ agentId: "worker-4", status: "failed" },
+	];
+	assert.equal(childCapacityNote("lead-1", []), undefined);
+	assert.equal(childCapacityNote("lead-1", four), undefined);
 	assert.equal(
-		childCapacityError("lead-1", [
-			{ agentId: "worker-64", status: "idle" },
-			{ agentId: "worker-67", status: "idle" },
-			{ agentId: "worker-75", status: "running" },
-			{ agentId: "worker-76", status: "failed" },
-		]),
-		"lead-1 already has 4 active children: worker-64 (idle), worker-67 (idle), worker-75 (running), worker-76 (failed) — 2 idle may be released via team_cancel",
-	);
-	assert.equal(
-		childCapacityError("lead-2", [
-			{ agentId: "worker-1", status: "running" },
-			{ agentId: "worker-2", status: "starting" },
-			{ agentId: "worker-3", status: "recovering" },
-			{ agentId: "worker-4", status: "running" },
-		]),
-		"lead-2 already has 4 active children: worker-1 (running), worker-2 (starting), worker-3 (recovering), worker-4 (running)",
+		childCapacityNote("lead-1", [...four, { agentId: "worker-5", status: "starting" }]),
+		"lead-1 now has 5 active children, past the soft limit of 4: worker-1 (running), worker-2 (idle), worker-3 (recovering), worker-4 (failed), worker-5 (starting) — 1 idle may be released via team_cancel. The role was created; release extra roles unless each one owns genuinely independent work.",
 	);
 });
 
@@ -146,6 +141,64 @@ test("durable team state and events survive restart reads", async () => {
 		assert.deepEqual(readJsonFile(statePath), { focusedBossId: "boss-2", agents: [{ agentId: "boss-2" }] });
 		assert.deepEqual(readJsonLines(eventsPath), [{ seq: 1, content: "first" }]);
 		assert.deepEqual((await readdir(join(root, "team"))).filter((name) => name.endsWith(".tmp")), []);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("workspace registry rebuilds the structure chain without any Pi session", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-team-registry-"));
+	try {
+		// A team that only left per-role instance.json files behind: structure and role transcript are still recoverable.
+		const legacy = join(root, "legacy-storage");
+		const roleSession = join(root, "worker-transcript.jsonl");
+		await writeFile(roleSession, "{}\n", "utf8");
+		const instance = (agentId, extra) => JSON.stringify({ actorEpoch: "epoch", agentId, role: "worker", task: `Rebuild ${agentId}`, teamId: "team-legacy", ...extra });
+		await mkdir(join(legacy, "agents", "worker-7"), { recursive: true });
+		await writeFile(join(legacy, "agents", "worker-7", "instance.json"), instance("worker-7", { parentId: "lead-3", sessionPath: roleSession }), "utf8");
+		await mkdir(join(legacy, "agents", "lead-9"), { recursive: true });
+		await writeFile(join(legacy, "agents", "lead-9", "instance.json"), instance("lead-9", { role: "lead" }), "utf8");
+		await writeFile(join(legacy, "events.jsonl"), `${JSON.stringify({ content: "Removed lead-9", kind: "control", targetIds: ["lead-9"] })}\n`, "utf8");
+
+		const legacyState = findStandaloneState(root, legacy);
+		assert.equal(legacyState?.directory, legacy);
+		assert.deepEqual(legacyState?.state.agents.map((agent) => [agent.agentId, agent.parentId, agent.sessionPath]), [["worker-7", "lead-3", roleSession]]);
+
+		// The registry itself is enough, a preferred directory outranks it, and a storage id that escapes the workspace is ignored.
+		const storage = join(root, "storage-a");
+		await writeJsonAtomic(join(storage, "state.json"), { version: 1, teamId: "team-a", focusedBossId: "boss-1", agents: [{ agentId: "boss-1", role: "boss", status: "idle", task: "From state.json" }] });
+		await writeFile(join(root, "latest.json"), JSON.stringify({ version: 1, teamId: "team-a", storageId: "storage-a", agents: [{ agentId: "boss-1", role: "boss", status: "idle", task: "From the registry" }] }), "utf8");
+		assert.equal(findStandaloneState(root)?.state.agents[0].task, "From the registry");
+		assert.equal(findStandaloneState(root, legacy)?.directory, legacy);
+		assert.equal(findStandaloneState(root, legacy)?.state.agents[0].agentId, "worker-7");
+		// When the preferred directory is the registry directory itself, the atomic registry copy is used as-is.
+		assert.equal(findStandaloneState(root, storage)?.state.agents[0].task, "From the registry");
+		await writeFile(join(root, "latest.json"), JSON.stringify({ version: 1, teamId: "team-b", storageId: "../escape", agents: [{ agentId: "boss-9", role: "boss", status: "idle", task: "Nope" }] }), "utf8");
+		assert.notEqual(findStandaloneState(root)?.state.agents[0]?.agentId, "boss-9");
+
+		// A legacy pointer snapshot has no agents, but still names the team directory to try first.
+		await writeFile(join(root, "latest.json"), JSON.stringify({ version: 1, storageId: "legacy-storage", updatedAt: "2000-01-01T00:00:00.000Z" }), "utf8");
+		assert.equal(findStandaloneState(root)?.directory, legacy);
+
+		// Ownership: only a Supervisor still answering its probe for this team counts, so a recycled port or PID cannot
+		// block recovery and a live Team is never adopted twice.
+		assert.equal(await supervisorAlive({ teamId: "team-a" }), undefined);
+		assert.equal(await supervisorAlive({ supervisorUrl: "http://127.0.0.1:9", teamId: "team-a" }), undefined);
+		let probePid = process.pid + 1;
+		const probe = createServer((_request, response) => {
+			response.writeHead(200, { "content-type": "application/json" });
+			response.end(JSON.stringify({ ok: true, pid: probePid, teamId: "team-a" }));
+		});
+		await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+		try {
+			const url = `http://127.0.0.1:${probe.address().port}`;
+			assert.equal((await supervisorAlive({ supervisorUrl: url, teamId: "team-a" }))?.pid, probePid);
+			assert.equal(await supervisorAlive({ supervisorUrl: url, teamId: "team-b" }), undefined);
+			probePid = process.pid;
+			assert.equal(await supervisorAlive({ supervisorUrl: url, teamId: "team-a" }), undefined);
+		} finally {
+			await new Promise((resolve) => probe.close(resolve));
+		}
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

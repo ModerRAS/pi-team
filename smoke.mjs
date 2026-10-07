@@ -145,6 +145,10 @@ try {
 	const latest = JSON.parse(readFileSync(join(cwd, ".pi", "pi-team", "latest.json"), "utf8"));
 	teamAgentDir = join(cwd, ".pi", "pi-team", latest.storageId, "agents");
 	const bossConfig = JSON.parse(readFileSync(resolve(teamAgentDir, "boss-1/instance.json"), "utf8"));
+	// The workspace registry is the self-owned recovery source: full snapshot, not just a pointer, and each role records
+	// the absolute path of its own transcript so a rebuild can reattach it.
+	if (!latest.updatedAt || !latest.agents?.some((agent) => agent.agentId === "boss-1")) throw new Error("latest.json is not a full workspace registry snapshot");
+	if (!bossConfig.sessionPath || !existsSync(bossConfig.sessionPath)) throw new Error("instance.json does not record the role session transcript path");
 	const identities = await postAs(bossConfig, "/identities", {});
 	const inherited = (identities.identities ?? []).find((row) => row.identity === "inherited");
 	if (!inherited?.pattern) throw new Error("/identities did not expose the built-in inherited identity with a resolved main model");
@@ -210,20 +214,28 @@ try {
 	const artifactPath = `smoke-artifacts/${workers[1].agent.agentId}.md`;
 	const obligation = await postAs(workerConfigs[1], "/require-artifact", { path: artifactPath, note: "Smoke: a declared artifact that never appears must be a hard settle failure." });
 	if (!obligation.artifacts?.includes(artifactPath)) throw new Error("Artifact obligation was not recorded on the agent");
-	await postAs(leadConfig, "/send", { target: workers[1].agent.agentId, message: "TEAM_MSG_ARTIFACT_TASK: finish your assigned task, then settle." });
+	await postAs(leadConfig, "/send", { target: workers[1].agent.agentId, message: "TEAM_MSG_ARTIFACT_TASK: do not create any file; simply report status and settle now." });
 	await waitForEntry((items) => items.some((entry) => entry.customType === "pi-team-event" && entry.data?.kind === "error" && String(entry.data?.content).includes(`settled without required artifact(s): ${artifactPath}`)));
 
-	let fifthRejected = false;
-	try { await postAs(leadConfig, "/delegate", { task: "This fifth worker must be rejected.", reason: "Verify the hard safety ceiling still rejects a fifth concurrent Worker." }); }
-	catch (error) { fifthRejected = /already has 4 active children: .*\((idle|running|starting|recovering|failed)\)/.test(String(error)); }
-	if (!fifthRejected) throw new Error("Fifth Worker was not rejected by the capacity limit with per-child states");
+	// Soft capacity: past-limit delegation still creates the role, and the result carries the headcount reminder.
+	const overflow = await postAs(leadConfig, "/delegate", { task: "Soft capacity smoke worker; wait for direction.", reason: "Verify past-limit delegation succeeds and returns the soft capacity warning." });
+	if (!overflow.agent?.agentId) throw new Error("Past-limit delegation did not create a Worker");
+	// The Lead is an LLM and may have delegated on its own, so the reminder is checked by shape, not by a fixed headcount.
+	const warning = String(overflow.warning || "");
+	const warned = warning.match(/now has (\d+) active children, past the soft limit of 4: (.*?)\. The role was created; release extra roles/);
+	if (!warned || Number(warned[1]) <= 4) throw new Error(`Past-limit delegation returned no capacity warning: ${JSON.stringify(warning)}`);
+	if (!/\((idle|running|starting|recovering|failed)\)/.test(warned[2])) throw new Error(`Capacity warning did not name child states: ${JSON.stringify(warning)}`);
+	if (!warned[2].includes(overflow.agent.agentId)) throw new Error(`Capacity warning did not list the new role: ${JSON.stringify(warning)}`);
+	await postAs(leadConfig, "/cancel", { target: overflow.agent.agentId });
+	const beforeRemoval = (await postAs(leadConfig, "/list", {})).agents.filter((agent) => agent.role === "worker").length;
 	await postAs(leadConfig, "/cancel", { target: workers[0].agent.agentId });
 	let listed = await postAs(leadConfig, "/list", {});
-	if (listed.agents.some((agent) => agent.agentId === workers[0].agent.agentId) || listed.agents.filter((agent) => agent.role === "worker").length !== 3) throw new Error("Lead removal did not delete its direct Worker from the active team");
+	const afterRemoval = listed.agents.filter((agent) => agent.role === "worker").length;
+	if (listed.agents.some((agent) => agent.agentId === workers[0].agent.agentId) || afterRemoval !== beforeRemoval - 1) throw new Error("Lead removal did not delete exactly its direct Worker from the active team");
 	const replacement = (await postAs(leadConfig, "/delegate", { task: "Replacement capacity smoke worker; wait for direction.", reason: "Verify removed capacity can be reused without reusing an old agent ID." })).agent;
 	if (workers.some((worker) => worker.agent.agentId === replacement.agentId)) throw new Error("Removed Worker agent ID was reused");
 	listed = await postAs(leadConfig, "/list", {});
-	if (listed.agents.filter((agent) => agent.role === "worker").length !== 4) throw new Error("Lead could not restore four active Workers after removal");
+	if (!listed.agents.some((agent) => agent.agentId === replacement.agentId)) throw new Error("Lead could not add a Worker after removal");
 	await postAs(bossConfig, "/cancel", { target: lead.agentId });
 	const afterLeadRemoval = await postAs(bossConfig, "/list", {});
 	if (afterLeadRemoval.agents.some((agent) => agent.agentId === lead.agentId || agent.parentId === lead.agentId)) throw new Error("Boss removal did not delete the Lead subtree from the active team");
@@ -235,7 +247,7 @@ try {
 	if (!entries.some((entry) => entry.customType === "pi-team-state" && entry.data?.focusedBossId === "boss-1")) throw new Error("Focused Boss was not persisted");
 	if (events.some((event) => event.type === "non-json")) throw new Error("RPC stdout contained non-JSON output");
 	if (stderr.trim()) throw new Error(`Supervisor stderr was not empty: ${stderr.trim()}`);
-	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 capacityLimit=ok+states inherited=ok listStatus=ok+full briefRefs=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
+	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 softCapacity=ok+states registry=ok+sessions inherited=ok listStatus=ok+full briefRefs=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
 } finally {
 	for (const item of pending.values()) {
 		clearTimeout(item.timer);
@@ -245,6 +257,6 @@ try {
 	if (process.platform === "win32" && child.pid) {
 		try { execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" }); } catch {}
 	} else child.kill("SIGKILL");
-	rmSync(cwd, { recursive: true, force: true });
+	rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 	if (nativeSessionDir) rmSync(nativeSessionDir, { recursive: true, force: true });
 }

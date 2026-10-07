@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { formatIdentityLines, formatStatusLines, taskSummary, type TeamStatusRow } from "./runtime.ts";
-export { BUILTIN_IDENTITIES, INHERITED_IDENTITY, INSPECTION_INTERVAL_MS, degeneratePoolNote, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, taskSummary, writeJsonAtomic, type ModelPool, type RpcPromptRequester, type TeamStatusRow, type TokenUsage } from "./runtime.ts";
+export { ADOPTION_WINDOW_MS, BUILTIN_IDENTITIES, INHERITED_IDENTITY, INSPECTION_INTERVAL_MS, degeneratePoolNote, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, readStandaloneState, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, writeJsonAtomic, type ModelPool, type PersistedState, type RpcPromptRequester, type TeamStatusRow, type TokenUsage } from "./runtime.ts";
 
 export type TeamRole = "boss" | "lead" | "worker";
 export type AgentStatus = "starting" | "running" | "idle" | "recovering" | "cancelled" | "failed";
@@ -15,6 +15,7 @@ export interface TeamInstanceConfig {
 	parentId?: string;
 	role: TeamRole;
 	serverUrl: string;
+	sessionPath?: string;
 	task: string;
 	teamId: string;
 	token: string;
@@ -61,16 +62,21 @@ export interface TeamSnapshot {
 export const TEAM_INSTANCE_FLAG = "team-instance";
 export const TEAM_EVENT_ENTRY = "pi-team-event";
 export const TEAM_STATE_ENTRY = "pi-team-state";
-export const MAX_CHILDREN = 4;
+export const CHILD_SOFT_LIMIT = 4;
 
 /** Tools that actually deliver work to a subordinate; prose naming a subordinate is not delivery. */
 export const DISPATCH_TOOLS = ["team_send", "team_delegate"] as const;
 
-/** Capacity rejection that names each child's state, so a releasable idle slot is not mistaken for a hard cap. */
-export function childCapacityError(parentId: string, children: { agentId: string; status: AgentStatus }[]): string {
+/**
+ * Soft capacity note. Delegation past the limit is accepted, but the delegator is told the resulting headcount and
+ * states, so a releasable idle slot is named instead of a generic "too many agents" line. Returns nothing at or
+ * under the limit.
+ */
+export function childCapacityNote(parentId: string, children: { agentId: string; status: AgentStatus }[]): string | undefined {
+	if (children.length <= CHILD_SOFT_LIMIT) return undefined;
 	const listed = children.map((child) => `${child.agentId} (${child.status})`).join(", ");
 	const idle = children.filter((child) => child.status === "idle").length;
-	return `${parentId} already has ${children.length} active children: ${listed}${idle ? ` — ${idle} idle may be released via team_cancel` : ""}`;
+	return `${parentId} now has ${children.length} active children, past the soft limit of ${CHILD_SOFT_LIMIT}: ${listed}${idle ? ` — ${idle} idle may be released via team_cancel` : ""}. The role was created; release extra roles unless each one owns genuinely independent work.`;
 }
 
 /** Messages this actor sent whose target produced no later event: the sender cannot see "delivered" as "received". */
@@ -197,12 +203,13 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 			label: "Team Delegate",
 			description:
 				expectedRole === "boss"
-					? "Delegate substantive project execution to the minimum sufficient Department Leads. For new non-conflicting tasks, create Leads in parallel by default; do not cancel an existing Team unless the user explicitly says stop, pause, or replace."
-					: "Delegate substantive execution to the minimum sufficient Workers. One coherent task normally needs one Worker; capacity is not a target.",
+					? "Delegate substantive project execution to the minimum sufficient Department Leads. For new non-conflicting tasks, create Leads in parallel by default; do not cancel an existing Team unless the user explicitly says stop, pause, or replace. " + `More than ${CHILD_SOFT_LIMIT} direct Leads is allowed but returns a capacity warning.`
+					: "Delegate substantive execution to the minimum sufficient Workers. One coherent task normally needs one Worker; capacity is not a target. " + `More than ${CHILD_SOFT_LIMIT} direct Workers is allowed but returns a capacity warning.`,
 			promptGuidelines: expectedRole === "boss"
 				? [
 					"Do not implement substantive project work yourself; scope it and delegate execution to the minimum sufficient Leads.",
 					"For a new set of non-conflicting tasks, create a Lead for each task in parallel by default; use one Lead only when the work is truly one coherent workstream.",
+				`${CHILD_SOFT_LIMIT} direct Leads is a soft limit, not a hard cap: past it the delegation still succeeds and returns a capacity warning, so add only genuinely independent work and release the rest via team_cancel.`,
 					"Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace.",
 					"Call team_models before delegation. Leads normally use high: choose vision-high only for visual or GUI evidence, otherwise text-high; pass only an available identity.",
 					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
@@ -210,6 +217,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				: [
 					"Do not implement substantive Worker tasks yourself; coordinate, review, and delegate execution.",
 					"Use one Worker for one coherent task and add more only for genuinely independent parallel work.",
+				`${CHILD_SOFT_LIMIT} direct Workers is a soft limit, not a hard cap: past it the delegation still succeeds and returns a capacity warning, so add only genuinely independent work and release the rest via team_cancel.`,
 					"Call team_models before delegation. Prefer medium for ordinary work, low for simple bounded work, and high only for genuinely complex work; choose vision only for visual or GUI evidence, otherwise text.",
 					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
 				],
@@ -220,10 +228,11 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers; \"inherited\" means the main session model" })),
 			}),
 			async execute(_id, params) {
-				const result = await request<{ agent: AgentRecord; eventId: string; seq: number; timestamp: string }>(config, "/delegate", params);
+				const result = await request<{ agent: AgentRecord; eventId: string; seq: number; timestamp: string; warning?: string }>(config, "/delegate", params);
 				const reminder = params.identity ? "" : "\nNote: no identity was passed; call team_models and re-delegate with an identity if you have not.";
+				const warning = result.warning ? `\nWarning: ${result.warning}` : "";
 				return {
-					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId} "${taskSummary(result.agent.task)}" (brief ${result.agent.task.length} chars) as #${result.seq}.${reminder}` }],
+					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId} "${taskSummary(result.agent.task)}" (brief ${result.agent.task.length} chars) as #${result.seq}.${reminder}${warning}` }],
 					details: result,
 				};
 			},

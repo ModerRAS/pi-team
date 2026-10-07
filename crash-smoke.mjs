@@ -1,5 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 if (process.platform !== "win32") {
@@ -7,7 +9,8 @@ if (process.platform !== "win32") {
 	process.exit(0);
 }
 
-const cwd = resolve(import.meta.dirname, "../..");
+// Isolated workspace: this test must not adopt a Team that a real pi-team run left in the repository.
+const cwd = mkdtempSync(join(tmpdir(), "pi-team-crash-"));
 const extension = resolve(import.meta.dirname, "index.ts");
 const child = spawn("pi.cmd", ["--mode", "rpc", "--no-session", "--no-extensions", "-e", extension], {
 	cwd,
@@ -89,4 +92,5 @@ try {
 	console.log(`PASS Supervisor ${parentPid} crash terminated Boss ${bossPid}`);
 } finally {
 	child.kill();
+	setTimeout(() => rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }), 1500);
 }
