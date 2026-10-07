@@ -388,8 +388,9 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		mirror?.appendCustomEntry(TEAM_STATE_ENTRY, state);
 		if (statePath) writeJsonAtomic(statePath, state);
 		// Workspace registry: the snapshot of record, read by recovery without any Pi session chain, so a team survives
-		// /new, branch switches, compaction, and --no-session runs.
-		if (stateRoot && stateDir) writeJsonAtomic(join(stateRoot, "latest.json"), state);
+		// /new, branch switches, compaction, and --no-session runs. A session that owns no agent (including one that
+		// declined a restorable Team) never rewrites it, so the declined snapshot waits untouched for /team-restore.
+		if (stateRoot && stateDir && agents.size) writeJsonAtomic(join(stateRoot, "latest.json"), state);
 	}
 
 	function appendEvent(input: Omit<TeamEvent, "eventId" | "seq" | "timestamp">): TeamEvent {
@@ -494,6 +495,9 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			}
 		} else stateDir = sessionStateDir;
 		if (restorableTeam) {
+			// The restorable Team's snapshot stays on disk for /team-restore; this session gets its own scratch state
+			// directory so binding, /team, and a fresh /boss keep working while the Team stays empty.
+			stateDir = sessionStateDir;
 			const message = restorableTeam.live
 				? `Pi Team ${restorableTeam.teamId} is still running in another Supervisor; this session stays empty. Run /team-restore to take over.`
 				: `A persisted Pi Team (${restorableTeam.teamId}) was last active ${lastActiveLabel(restorableTeam)} and was not restored automatically; run /team-restore to adopt it.`;

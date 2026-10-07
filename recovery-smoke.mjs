@@ -4,7 +4,7 @@
  * Uses real `pi --mode rpc` processes in a temp workspace; no mocks.
  */
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -86,7 +86,8 @@ function killTree(state) {
 	state.child.kill();
 }
 
-const registryPath = join(cwd, ".pi", "pi-team", "latest.json");
+const stateRoot = join(cwd, ".pi", "pi-team");
+const registryPath = join(stateRoot, "latest.json");
 const readRegistry = () => JSON.parse(readFileSync(registryPath, "utf8"));
 
 async function bootTeam() {
@@ -160,9 +161,12 @@ try {
 	const staleRegistry = readRegistry();
 	const staleAt = new Date(Date.now() - 60 * 24 * 3_600_000).toISOString();
 	writeFileSync(registryPath, JSON.stringify({ ...staleRegistry, updatedAt: staleAt }), "utf8");
+	const staleDirs = readdirSync(stateRoot).length;
 	const stale = boot("stale");
 	await send(stale, "get_state");
 	await waitFor("the stale-team notice", async () => events(await entries(stale)).some((event) => /was not restored automatically/.test(String(event.content))));
+	// The declining session must still finish binding: it keeps its own state directory instead of aborting.
+	await waitFor("the declining session to create its own state directory", () => readdirSync(stateRoot).length > staleDirs, 15_000);
 	if (!existsSync(registryPath)) throw new Error("the stale registry was deleted instead of being kept for /team-restore");
 	const untouched = readRegistry();
 	if (untouched.updatedAt !== staleAt) throw new Error(`a stale registry was rewritten instead of being left for /team-restore (${staleAt} -> ${untouched.updatedAt} via ${untouched.supervisorUrl})`);
