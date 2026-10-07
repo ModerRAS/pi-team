@@ -242,7 +242,7 @@ UI 把所有正常聊天和执行细节分流：
 
 ### Agent Inspector
 
-底部 Team 状态按 Boss → Lead → Worker 三层树展示，Lead 行显示直属 Worker 数量。`/cancel` 完成后，目标子树从活动 registry、持久快照、角色列表和该树中移除；角色独立 Session 与正式事件日志继续保留用于审计。选择角色后显示：
+底部 Team 状态按 Boss → Lead → Worker 三层树展示，每行以 `名字 (agent-id)` 开头，Lead 行显示直属 Worker 数量。角色名字由委派方在 `team_delegate` 的 `name` 参数给出（Boss 命名 Lead 的工作线/部门，Lead 命名 Worker 的工作单元），必须是一个词（字母/数字/`-`/`_`，≤ 24 字符，Team 内唯一），这样名字既能上屏也能直接当地址用；未命名时用 brief 首行派生，重名自动加 `-2`。非法名字在委派时就拒绝，错误文本里带上改写指引，避免模型反复提交同一个坏名字。`/cancel` 完成后，目标子树从活动 registry、持久快照、角色列表和该树中移除；角色独立 Session 与正式事件日志继续保留用于审计。选择角色后显示：
 
 - 角色运行状态。
 - 工具调用生命周期。

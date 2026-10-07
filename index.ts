@@ -14,10 +14,12 @@ import {
 	CHILD_SOFT_LIMIT,
 	INHERITED_IDENTITY,
 	INSPECTION_INTERVAL_MS,
+	ROLE_NAME_GUIDE,
 	TEAM_EVENT_ENTRY,
 	TEAM_INSTANCE_FLAG,
 	TEAM_STATE_ENTRY,
 	childCapacityNote,
+	fallbackRoleName,
 	findStandaloneState,
 	formatAgentTree,
 	formatIdentityUsageLine,
@@ -31,12 +33,14 @@ import {
 	readStandaloneState,
 	registerRoleExtension,
 	resolveSpawnModel,
+	roleNameError,
 	sendRpcPrompt,
 	sumTokenUsage,
 	supervisorAlive,
 	taskSummary,
 	undispatchedTargets,
 	unansweredMessages,
+	uniqueRoleName,
 	writeJsonAtomic,
 	type AgentRecord,
 	type AgentStatus,
@@ -55,8 +59,8 @@ const TEAM_WIDGET_KEY = "pi-team-agents";
 const RECOVERY_LIMIT = 3;
 const ROLE_NAMES: Record<TeamRole, string> = { boss: "Boss", lead: "Lead", worker: "Worker" };
 const ROLE_PROMPTS: Record<TeamRole, string> = {
-	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. ${CHILD_SOFT_LIMIT} direct Leads is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Lead only for genuinely independent work and release the rest with team_cancel. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. team_list reports state by default; request mode "full" only when you need a role's brief text. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
-	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. ${CHILD_SOFT_LIMIT} direct Workers is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Worker only for genuinely independent work and release the rest with team_cancel. Before adding another Worker, call team_list and explain why existing Workers cannot handle it. team_list reports state by default; request mode "full" only when you need a role's brief text.`,
+	boss: `You are a Boss in a Pi coding team. You are a strictly event-driven coordinator and decision-maker, not a project implementer. For substantive project work, do not edit files, run implementation commands, or carry out the task yourself. Inspect only enough to scope and verify, then reuse or create the minimum sufficient Department Leads. For a new set of non-conflicting tasks, default to creating a Lead for each task in parallel; use one Lead only when the work is truly one coherent workstream. Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace. Before creating a Lead, call team_models and choose an available identity by business need. Leads normally use a high tier: choose vision-high only when the Lead must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text-high. Use another available tier only when the task clearly does not need high-tier planning or review. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Name every Lead after its workstream or department through the team_delegate name parameter (one token, e.g. "nav-tree", "发布线"). Act only on the current user message or a new Lead report. Handle that event by deciding, delegating, verifying, or reporting, then stop and remain idle until another external event arrives. Never invent follow-up work or keep working merely to stay busy. ${CHILD_SOFT_LIMIT} direct Leads is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Lead only for genuinely independent work and release the rest with team_cancel. Before adding another Lead, call team_list and explain why existing Leads cannot own the work. team_list reports state by default; request mode "full" only when you need a role's brief text. Trivial questions, status checks, and Team control commands may be answered directly without delegation.`,
+	lead: `You are a Department Lead in a Pi coding team. You are an event-driven coordinator and reviewer, not a project implementer. For substantive execution, do not edit files or carry out Worker tasks yourself. On a Boss assignment, scope it, reuse or create the minimum useful Workers, send concrete tasks, then stop and remain idle. Before creating a Worker, call team_models and choose an available identity by business need. Workers normally use medium or low tiers: use medium for ordinary implementation, investigation, and testing; use low for simple, bounded, low-risk work; use high only when the Worker task genuinely needs complex reasoning or unusually strong execution. At any tier, choose vision only when the Worker must inspect images, screenshots, video, GUI state, or other visual evidence; otherwise choose text. Never invent an identity that team_models did not return. The built-in identity "inherited" always means the main session model; pass it when every role should run on the same model. Name every Worker after its unit of work through the team_delegate name parameter (one token, e.g. "hero-pages", "verify-a"). One coherent execution task normally needs one Worker; add Workers only for genuinely independent parallel work. Worker progress, settled/idle, crash, and recovery reports will wake you. On those events, inspect the report, intervene only when correction or unblocking is needed, summarize meaningful completion or risk to your Boss, then stop and idle again. Do not create routine follow-up work merely to stay active. ${CHILD_SOFT_LIMIT} direct Workers is a soft limit, not a hard cap: delegation past it still succeeds but returns a capacity warning, so add the extra Worker only for genuinely independent work and release the rest with team_cancel. Before adding another Worker, call team_list and explain why existing Workers cannot handle it. team_list reports state by default; request mode "full" only when you need a role's brief text.`,
 	worker: `You are a Worker in a Pi coding team. Execute the concrete task assigned to you using the full Pi tool environment. You receive only task-relevant messages. Explain your next actions and findings normally; your text is visible to your Department Lead and the user. Ask your Lead when blocked. You cannot create other agents.`,
 };
 
@@ -225,7 +229,7 @@ export class TeamActivityPanel {
 		if (inspected) {
 			const usageLine = inspected.tokenUsage ? formatTokenUsage(inspected.tokenUsage) : "";
 			const lines = [
-				`INSPECT ${pathOf(inspected.agentId)}`,
+				`INSPECT ${inspected.name} (${pathOf(inspected.agentId)})`,
 				`[${inspected.identity ?? "inherited"}: ${inspected.model ?? "default"}]`,
 				`[${inspected.role}/${inspected.status} r${inspected.runCount ?? 0}]`,
 				...(usageLine ? [usageLine] : []),
@@ -857,6 +861,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			agentId: agent.agentId,
 			departmentId: agent.departmentId,
 			identity: agent.identity,
+			name: agent.name,
 			parentId: agent.parentId,
 			role: agent.role,
 			serverUrl,
@@ -978,12 +983,18 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		if (role === "worker" && parent?.role !== "lead") throw new Error("Only a Department Lead can own a Worker");
 		const identityKey = identity?.trim() || undefined;
 		const model = resolveSpawnModel(modelPool, identityKey, context?.model);
+		const requestedName = name?.trim();
+		if (requestedName) {
+			const invalid = roleNameError(requestedName);
+			if (invalid) throw new Error(`Invalid role name "${requestedName}": ${invalid}. ${ROLE_NAME_GUIDE}`);
+		}
 		const index = nextAgentIndexes[role]++;
 		const agentId = `${role}-${index}`;
+		const roleName = uniqueRoleName(requestedName || fallbackRoleName(task, `${ROLE_NAMES[role]} ${index}`), [...agents.values()].map((agent) => agent.name));
 		const departmentId = role === "lead" ? agentId : role === "worker" ? parent?.departmentId : undefined;
 		const agent: RuntimeAgent = {
 			actorEpoch: randomUUID(), agentId, artifactNudged: false, configPath: "", departmentId, details: [], identity: identityKey, intentionalStop: false, lastAssistantText: "", lastEventAt: undefined, model,
-			name: name?.trim() || `${ROLE_NAMES[role]} ${index}`, parentId, pendingParentMessages: [], progressTimer: undefined, recoveryAttempts: 0, role, runCount: 0, runTools: [],
+			name: roleName, parentId, pendingParentMessages: [], progressTimer: undefined, recoveryAttempts: 0, role, runCount: 0, runTools: [],
 			status: "starting", task: task.trim(), token: randomBytes(24).toString("hex"),
 		};
 		agents.set(agentId, agent);
@@ -1069,6 +1080,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 			identity: agent.identity,
 			lastEventAgeMs: agent.lastEventAt && agent.status !== "starting" ? Date.now() - agent.lastEventAt : undefined,
 			model: agent.model,
+			name: agent.name,
 			noReport: agent.status === "idle" && agent.lastSettleHadReport === false ? true : undefined,
 			parentId: agent.parentId,
 			path: agentPath(agent.agentId),
@@ -1301,7 +1313,7 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		if (!agent) return ctx.ui.notify("Usage: /inspect <agent-id|off>", "warning");
 		inspectedAgentId = agent.agentId;
 		updateUi();
-		ctx.ui.notify([`${agentPath(agent.agentId)} [${agent.role}/${agent.status} r${agent.runCount ?? 0}]`, `Task: ${agent.task}`, ...agent.details.slice(-10)].join("\n"), "info");
+		ctx.ui.notify([`${agent.name} ${agentPath(agent.agentId)} [${agent.role}/${agent.status} r${agent.runCount ?? 0}]`, `Task: ${agent.task}`, ...agent.details.slice(-10)].join("\n"), "info");
 	}});
 
 	pi.on("input", async (event) => {

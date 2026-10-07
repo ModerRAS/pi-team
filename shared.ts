@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { formatIdentityLines, formatStatusLines, taskSummary, type TeamStatusRow } from "./runtime.ts";
-export { ADOPTION_WINDOW_MS, BUILTIN_IDENTITIES, INHERITED_IDENTITY, INSPECTION_INTERVAL_MS, degeneratePoolNote, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, readStandaloneState, resolveModelPattern, resolveSpawnModel, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, writeJsonAtomic, type ModelPool, type PersistedState, type RpcPromptRequester, type TeamStatusRow, type TokenUsage } from "./runtime.ts";
+import { ROLE_NAME_GUIDE, formatIdentityLines, formatStatusLines, taskSummary, type TeamStatusRow } from "./runtime.ts";
+export { ADOPTION_WINDOW_MS, BUILTIN_IDENTITIES, INHERITED_IDENTITY, INSPECTION_INTERVAL_MS, ROLE_NAME_GUIDE, ROLE_NAME_MAX, degeneratePoolNote, fallbackRoleName, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, readStandaloneState, resolveModelPattern, resolveSpawnModel, roleNameError, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, uniqueRoleName, writeJsonAtomic, type ModelPool, type PersistedState, type RpcPromptRequester, type TeamStatusRow, type TokenUsage } from "./runtime.ts";
 
 export type TeamRole = "boss" | "lead" | "worker";
 export type AgentStatus = "starting" | "running" | "idle" | "recovering" | "cancelled" | "failed";
@@ -12,6 +12,7 @@ export interface TeamInstanceConfig {
 	agentId: string;
 	departmentId?: string;
 	identity?: string;
+	name?: string;
 	parentId?: string;
 	role: TeamRole;
 	serverUrl: string;
@@ -212,6 +213,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				`${CHILD_SOFT_LIMIT} direct Leads is a soft limit, not a hard cap: past it the delegation still succeeds and returns a capacity warning, so add only genuinely independent work and release the rest via team_cancel.`,
 					"Do not cancel an existing Team or its roles unless the user explicitly says stop, pause, or replace.",
 					"Call team_models before delegation. Leads normally use high: choose vision-high only for visual or GUI evidence, otherwise text-high; pass only an available identity.",
+					"Name every Lead after its workstream or department through name (one token, e.g. \"nav-tree\", \"发布线\"); the name labels the role in the Team panel and can address it.",
 					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
 				]
 				: [
@@ -219,12 +221,13 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 					"Use one Worker for one coherent task and add more only for genuinely independent parallel work.",
 				`${CHILD_SOFT_LIMIT} direct Workers is a soft limit, not a hard cap: past it the delegation still succeeds and returns a capacity warning, so add only genuinely independent work and release the rest via team_cancel.`,
 					"Call team_models before delegation. Prefer medium for ordinary work, low for simple bounded work, and high only for genuinely complex work; choose vision only for visual or GUI evidence, otherwise text.",
+					"Name every Worker after its unit of work through name (one token, e.g. \"hero-pages\", \"verify-a\"); the name labels the role in the Team panel and can address it.",
 					"team_list reports state by default; pass mode \"full\" only when you need a role's brief text.",
 				],
 			parameters: Type.Object({
 				task: Type.String({ description: "Concrete delegated task with a verifiable outcome" }),
 				reason: Type.String({ minLength: 12, description: "Why this needs a new role rather than a suitable existing subordinate" }),
-				name: Type.Optional(Type.String({ description: "Short display name" })),
+				name: Type.Optional(Type.String({ description: ROLE_NAME_GUIDE })),
 				identity: Type.Optional(Type.String({ description: "Available identity returned by team_models, normally text-high/vision-high for Leads and text-medium/vision-medium or low for Workers; \"inherited\" means the main session model" })),
 			}),
 			async execute(_id, params) {
@@ -232,7 +235,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 				const reminder = params.identity ? "" : "\nNote: no identity was passed; call team_models and re-delegate with an identity if you have not.";
 				const warning = result.warning ? `\nWarning: ${result.warning}` : "";
 				return {
-					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId} "${taskSummary(result.agent.task)}" (brief ${result.agent.task.length} chars) as #${result.seq}.${reminder}${warning}` }],
+					content: [{ type: "text", text: `Created ${result.agent.role} ${result.agent.agentId} "${result.agent.name}" for "${taskSummary(result.agent.task)}" (brief ${result.agent.task.length} chars) as #${result.seq}.${reminder}${warning}` }],
 					details: result,
 				};
 			},
@@ -303,7 +306,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 	pi.registerTool({
 		name: "team_list",
 		label: "Team List",
-		description: "List the Pi Team roles you are allowed to see. Status mode (default) reports id, role, state, identity, last activity and a one-line task summary; pass mode \"full\" only when you need each role's complete brief text, which is already in your own delegation history.",
+		description: "List the Pi Team roles you are allowed to see. Status mode (default) reports name, id, role, state, identity, last activity and a one-line task summary; pass mode \"full\" only when you need each role's complete brief text, which is already in your own delegation history.",
 		parameters: Type.Object({
 			mode: Type.Optional(Type.Union([Type.Literal("status"), Type.Literal("full")], { description: "status (default): state only; full: include the complete delegated brief per role" })),
 		}),
@@ -311,7 +314,7 @@ export function registerRoleExtension(pi: ExtensionAPI, expectedRole: TeamRole):
 			const mode = params.mode === "full" ? "full" : "status";
 			const result = await request<{ agents: TeamStatusRow[] | AgentRecord[]; mode: string }>(config, "/list", { mode });
 			const text = mode === "full"
-				? (result.agents as AgentRecord[]).map((agent) => `${agent.path || agent.agentId} [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n")
+				? (result.agents as AgentRecord[]).map((agent) => `${agent.name} (${agent.path || agent.agentId}) [${agent.role}/${agent.status} r${agent.runCount ?? 0}] ${agent.task}`).join("\n")
 				: formatStatusLines(result.agents as TeamStatusRow[]).join("\n");
 			return { content: [{ type: "text", text: text || "No team agents." }], details: result };
 		},
