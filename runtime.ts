@@ -20,6 +20,7 @@ type TreeAgent = {
 	agentId: string;
 	identity?: string;
 	model?: string;
+	name?: string;
 	parentId?: string;
 	role: "boss" | "lead" | "worker";
 	runCount?: number;
@@ -29,7 +30,7 @@ type TreeAgent = {
 
 export function formatAgentTree(allAgents: TreeAgent[], focusedBossId?: string): string[] {
 	const children = (parentId: string, role: TreeAgent["role"]): TreeAgent[] => allAgents.filter((agent) => agent.parentId === parentId && agent.role === role);
-	const label = (agent: TreeAgent): string => `${agent.agentId} [${agent.identity ?? "inherited"}: ${agent.model ?? "default"}] [${agent.status} r${agent.runCount ?? 0}]${agent.tokenUsage ? ` ${formatTokenUsage(agent.tokenUsage)}` : ""}`;
+	const label = (agent: TreeAgent): string => `${agent.name && agent.name !== agent.agentId ? `${agent.name} (${agent.agentId})` : agent.agentId} [${agent.identity ?? "inherited"}: ${agent.model ?? "default"}] [${agent.status} r${agent.runCount ?? 0}]${agent.tokenUsage ? ` ${formatTokenUsage(agent.tokenUsage)}` : ""}`;
 	const lines: string[] = [];
 	for (const boss of allAgents.filter((agent) => agent.role === "boss")) {
 		lines.push(`${boss.agentId === focusedBossId ? ">" : " "} ${label(boss)}`);
@@ -86,6 +87,52 @@ export function identityRows(pool: ModelPool, mainModel?: { provider: string; id
 
 export const INSPECTION_INTERVAL_MS = 10 * 60_000;
 
+/** Role labels are single tokens: they label a role in the Team panel and can address it in team tools. */
+export const ROLE_NAME_MAX = 24;
+const ROLE_NAME_PATTERN = /^[\p{L}\p{N}_-]+$/u;
+const ROLE_NAME_RESERVED = new Set(["off", "group", "supervisor", "user"]);
+
+/** Why a delegator-supplied role name cannot be used, or undefined when it is valid. */
+export function roleNameError(name: string): string | undefined {
+	const trimmed = name.trim();
+	if (!trimmed) return "it is empty";
+	if (trimmed.length > ROLE_NAME_MAX) return `it is longer than ${ROLE_NAME_MAX} characters`;
+	if (/\s/.test(trimmed)) return "it contains whitespace";
+	if (!ROLE_NAME_PATTERN.test(trimmed)) return 'it contains characters other than letters, digits, "-" and "_"';
+	if (/^(?:boss|lead|worker)-\d+$/i.test(trimmed)) return "it looks like an agent id";
+	if (ROLE_NAME_RESERVED.has(trimmed.toLowerCase())) return "it is a reserved word";
+	return undefined;
+}
+
+/** Guidance attached to a rejected name so the delegating model can retry with a valid one. */
+export const ROLE_NAME_GUIDE = `Pass a short workstream label as name: 1-${ROLE_NAME_MAX} letters, digits, "-" or "_" (no spaces, no / # @ : [ ]), unique within the Team, for example "nav-tree" or "发布线".`;
+
+function sanitizeRoleName(value: string): string {
+	return value.replace(/[^\p{L}\p{N}_-]+/gu, "-").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, ROLE_NAME_MAX).replace(/-$/, "");
+}
+
+/** A valid label derived from the brief, used when the delegator did not name the role. */
+export function fallbackRoleName(task: string, fallback: string): string {
+	const derived = sanitizeRoleName(taskSummary(task, ROLE_NAME_MAX));
+	if (derived && !roleNameError(derived)) return derived;
+	const source = derived || sanitizeRoleName(fallback) || "role";
+	// Sanitizing cannot introduce punctuation, so the only rejectable form left is an id-like label.
+	const tail = "-role";
+	return roleNameError(source) ? `${source.slice(0, ROLE_NAME_MAX - tail.length)}${tail}` : source;
+}
+
+/** Keeps labels unambiguous: name resolution must never hit two roles, so duplicates get a numeric suffix. */
+export function uniqueRoleName(name: string, taken: Iterable<string>): string {
+	const used = new Set(taken);
+	if (!used.has(name)) return name;
+	for (let suffix = 2; suffix < 1000; suffix++) {
+		const tail = `-${suffix}`;
+		const candidate = `${name.slice(0, ROLE_NAME_MAX - tail.length)}${tail}`;
+		if (!used.has(candidate)) return candidate;
+	}
+	return name;
+}
+
 /** One line identifying a delegated brief without carrying its body. */
 export function taskSummary(task: string, max = 80): string {
 	const firstLine = task.split(/\r?\n/).find((line) => line.trim()) ?? "";
@@ -101,6 +148,7 @@ export interface TeamStatusRow {
 	identity?: string;
 	lastEventAgeMs?: number;
 	model?: string;
+	name?: string;
 	noReport?: boolean;
 	parentId?: string;
 	path: string;
@@ -114,7 +162,7 @@ export interface TeamStatusRow {
 export function formatStatusLines(rows: TeamStatusRow[]): string[] {
 	const age = (ms: number): string => ms >= 3_600_000 ? `${Math.floor(ms / 3_600_000)}h` : ms >= 60_000 ? `${Math.floor(ms / 60_000)}m` : `${Math.floor(ms / 1000)}s`;
 	const lines = rows.map((row) => {
-		const parts = [`${row.path} [${row.role}/${row.status} r${row.runCount}]`, row.identity ?? "inherited", `"${row.taskSummary}"`];
+		const parts = [row.name ? `${row.name} (${row.path})` : row.path, `[${row.role}/${row.status} r${row.runCount}]`, row.identity ?? "inherited", `"${row.taskSummary}"`];
 		if (row.lastEventAgeMs !== undefined) parts.push(`last event ${age(row.lastEventAgeMs)} ago`);
 		if (row.noReport) parts.push("no report since settle");
 		if (row.artifacts?.length) parts.push(`requires ${row.artifacts.join(", ")}`);
@@ -285,7 +333,7 @@ export function readStandaloneState(directory: string): PersistedState | undefin
 			actorEpoch: config.actorEpoch,
 			agentId: config.agentId,
 			departmentId: config.departmentId,
-			name: config.agentId,
+			name: config.name ?? config.agentId,
 			parentId: config.parentId,
 			role: config.role,
 			runCount: 0,

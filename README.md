@@ -121,7 +121,7 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 ### 事件与协调
 
 - 所有角色直接共享当前工作目录；插件不加锁、不创建 worktree，也不自动合并。
-- 所有 Boss、Lead、Worker 的正常文本写入线性正式事件日志并在主 transcript 上屏；底部被动面板只显示角色运行状态。
+- 所有 Boss、Lead、Worker 的正常文本写入线性正式事件日志并在主 transcript 上屏；底部被动面板按“名字 (agent-id)”显示每个角色的状态、模型档位和用量。
 - Boss 对一组新的、彼此不冲突的任务，默认并行创建对应的 Lead；只有任务确实属于同一个连贯工作流时才使用单个 Lead。
 - Boss 与 Lead 是事件驱动协调者，不直接承担实质项目实现；处理当前事件后停止，没有新外部事件时保持 idle。
 - Worker 的正常文本实时进入主 transcript；Worker `agent_settled` 后 Supervisor 必定通知直属 Lead。Lead 正在运行时通知用 `steer` 合入当前 loop，idle 时自动改用 `prompt` 启动新 loop；临近报告会批量合并。
@@ -141,6 +141,7 @@ Boss 使用 `team_delegate` 创建 Lead，Lead 使用同一工具创建 Worker�
 
 ### 计量与 UI
 
+- **角色命名**：Lead/Worker 由委派方通过 `team_delegate` 的 `name` 命名（一个词：字母/数字/`-`/`_`，≤ 24 字符，Team 内不重名）。Boss 的提示词要求按工作线/部门给 Lead 命名，Lead 按工作单元给 Worker 命名；没传名字时自动用 brief 首行派生，重名自动加 `-2` 后缀。名字显示在底部面板和 `team_list` 里（`导航树完整性 (lead-11) [text-high: …] [running r90]`），也可以直接当地址用（`/to`、`team_send`、`team_cancel`、`/focus`、`/inspect`）。非法名字（空格、`/`、`#`、`@`、`:`、`[`、`]`、超长、形如 agent id、保留词）会被拒绝，错误信息里附带改写指引。
 - 每个角色的 token 用量（输入、输出、缓存读写、费用）随每次 LLM 调用实时统计（`message_end` 事件），并在 settled 时与 Session 文件对账；随 Team 状态持久化。底部树和 Inspector 显示为 `in 1.2M out 340k cache 900k $0.42`。
 - 面板最底部单独一行按六档 identity 累计整个会话的模型开销，实时更新且不随角色移除而消失；每档压缩为 `text-medium 1.2M/45.0k/900.0k $0.42`（in/out/cache/费用）。
 - 底部 Team 面板按 Boss → Lead → Worker 三层树显示，每个角色显示所选档位和实际模型（如 `[text-medium: opencode-go/deepseek-v4-flash]`），未指定档位时显示 `[inherited: provider/model]`。
