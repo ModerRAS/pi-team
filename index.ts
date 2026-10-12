@@ -28,10 +28,12 @@ import {
 	getMessageText,
 	identityRows,
 	readInstanceConfig,
+	readJsonFile,
 	readJsonLines,
 	readModelPool,
 	readStandaloneState,
 	registerRoleExtension,
+	registryWriteAllowed,
 	resolveSpawnModel,
 	roleNameError,
 	sendRpcPrompt,
@@ -392,9 +394,13 @@ export default function piTeamExtension(pi: ExtensionAPI): void {
 		mirror?.appendCustomEntry(TEAM_STATE_ENTRY, state);
 		if (statePath) writeJsonAtomic(statePath, state);
 		// Workspace registry: the snapshot of record, read by recovery without any Pi session chain, so a team survives
-		// /new, branch switches, compaction, and --no-session runs. A session that owns no agent (including one that
-		// declined a restorable Team) never rewrites it, so the declined snapshot waits untouched for /team-restore.
-		if (stateRoot && stateDir && agents.size) writeJsonAtomic(join(stateRoot, "latest.json"), state);
+		// /new, branch switches, compaction, and --no-session runs. Only its owner may rewrite it, and the owner must
+		// also be able to publish an empty snapshot after /cancel — otherwise the next start resurrects the cancelled
+		// Team from the last non-empty snapshot, while a session that declined a restorable Team stays hands-off.
+		if (stateRoot && stateDir) {
+			const pointer = readJsonFile<{ storageId?: string }>(join(stateRoot, "latest.json"));
+			if (registryWriteAllowed(agents.size, stateDir, pointer)) writeJsonAtomic(join(stateRoot, "latest.json"), state);
+		}
 	}
 
 	function appendEvent(input: Omit<TeamEvent, "eventId" | "seq" | "timestamp">): TeamEvent {

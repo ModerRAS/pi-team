@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { AgentRecord, TeamEvent, TeamInstanceConfig, TeamRole, TeamSnapshot } from "./shared.ts";
 
 export interface RpcPromptRequester {
@@ -353,6 +353,15 @@ export function readRegistryState(root: string): { directory: string; state: Per
 	if (registry?.version !== 1 || !Array.isArray(registry.agents) || !registry.storageId) return undefined;
 	if (!/^[A-Za-z0-9_-]+$/.test(registry.storageId)) return undefined;
 	return { directory: join(root, registry.storageId), state: registry };
+}
+
+/**
+ * Whether this session may rewrite the workspace registry. A session with agents owns it, and a session whose own
+ * state directory is already the registry's storage is still its owner with no agents left — that is how `/cancel`
+ * publishes the empty snapshot. A session that never owned it (a declined restorable Team) must leave it alone.
+ */
+export function registryWriteAllowed(agentCount: number, stateDir: string, pointer: { storageId?: string } | undefined): boolean {
+	return agentCount > 0 || (Boolean(stateDir) && pointer?.storageId === basename(stateDir));
 }
 
 /**

@@ -247,9 +247,20 @@ try {
 	if (finalState?.data?.agents?.some((agent) => agent.agentId === "boss-1") || finalState?.data?.focusedBossId === "boss-1") throw new Error("User removal left the Boss active or focused");
 	if (!finalState?.data?.identityUsage || Object.values(finalState.data.identityUsage).every((usage) => !usage.input && !usage.output)) throw new Error("Session-wide identity usage was not persisted after removals");
 	if (!entries.some((entry) => entry.customType === "pi-team-state" && entry.data?.focusedBossId === "boss-1")) throw new Error("Focused Boss was not persisted");
+	// The registry must follow /cancel down to an empty snapshot, or the next start adopts the last non-empty one and resurrects the Team.
+	const registryPath = join(cwd, ".pi", "pi-team", "latest.json");
+	const registryDeadline = Date.now() + 15_000;
+	let registryState;
+	do {
+		registryState = JSON.parse(readFileSync(registryPath, "utf8"));
+		if (registryState.agents?.length === 0) break;
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+	} while (Date.now() < registryDeadline);
+	if (registryState?.agents?.length !== 0) throw new Error(`/cancel left ${registryState?.agents?.length} agents in the workspace registry`);
+	if (registryState.storageId !== latest.storageId) throw new Error("The empty registry snapshot lost its storage id");
 	if (events.some((event) => event.type === "non-json")) throw new Error("RPC stdout contained non-JSON output");
 	if (stderr.trim()) throw new Error(`Supervisor stderr was not empty: ${stderr.trim()}`);
-	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 softCapacity=ok+states registry=ok+sessions inherited=ok listStatus=ok+full briefRefs=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
+	console.log(`PASS boss replies=2 recoveryPid=${firstBossPid}->new hierarchy=1+2+5 softCapacity=ok+states registry=ok+cancelEmpty sessions inherited=ok listStatus=ok+full briefRefs=ok messaging=parent+sibling+cross-branch receipt=ok escalation=ok artifact=ok visibility=ok isolation=ok entries=${finalEntries.length} rpcEvents=${events.length}`);
 } finally {
 	for (const item of pending.values()) {
 		clearTimeout(item.timer);
