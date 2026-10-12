@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, ROLE_NAME_GUIDE, ROLE_NAME_MAX, degeneratePoolNote, fallbackRoleName, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, resolveModelPattern, resolveSpawnModel, roleNameError, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, uniqueRoleName, writeJsonAtomic } from "./runtime.ts";
+import { BUILTIN_IDENTITIES, INHERITED_IDENTITY, ROLE_NAME_GUIDE, ROLE_NAME_MAX, degeneratePoolNote, fallbackRoleName, findStandaloneState, formatAgentTree, formatIdentityLines, formatIdentityUsageLine, formatProgress, formatStatusLines, formatTokenUsage, identityRows, mainModelPattern, readJsonFile, readJsonLines, readModelPool, registryWriteAllowed, resolveModelPattern, resolveSpawnModel, roleNameError, sendRpcPrompt, sumTokenUsage, supervisorAlive, taskSummary, uniqueRoleName, writeJsonAtomic } from "./runtime.ts";
 import { childCapacityNote, undispatchedTargets, unansweredMessages } from "./shared.ts";
 
 test("capacity note stays silent at the soft limit and names states past it", () => {
@@ -170,6 +170,15 @@ test("the team panel and status lines label roles with their names", () => {
 		"     └─ default-hero-evidence (worker-181) [inherited: default] [idle r4]",
 	]);
 	assert.equal(formatStatusLines([{ agentId: "lead-11", name: "类型覆盖普查", path: "boss-1/lead-11", role: "lead", status: "running", runCount: 90, taskSummary: "普查全站类型" }])[0], "类型覆盖普查 (boss-1/lead-11) [lead/running r90] inherited \"普查全站类型\"");
+});
+
+test("the workspace registry follows its owner, including an empty Team", () => {
+	const pointer = { storageId: "session-a" };
+	assert.equal(registryWriteAllowed(0, join("root", "session-a"), pointer), true, "the owner publishes the empty snapshot after /cancel");
+	assert.equal(registryWriteAllowed(3, join("root", "session-a"), pointer), true, "a session with agents owns the registry");
+	assert.equal(registryWriteAllowed(0, join("root", "session-b"), pointer), false, "a declining session leaves another Team's registry alone");
+	assert.equal(registryWriteAllowed(0, join("root", "session-b"), undefined), false, "a session with no agents and no registry writes nothing");
+	assert.equal(registryWriteAllowed(1, join("root", "session-b"), pointer), true, "a new Team takes over the registry");
 });
 
 test("durable team state and events survive restart reads", async () => {
